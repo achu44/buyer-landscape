@@ -78,6 +78,32 @@ class BuyerCandidate(BaseModel):
     sources: list[str] = Field(default_factory=list)
 
 
+class BuyerCandidateBatch(BaseModel):
+    """Output of a specialist research agent (strategic or sponsor) for one
+    routing step. Validated as a unit — rather than as a bare
+    list[BuyerCandidate] — so a malformed batch (empty, wrong buyer_type,
+    duplicate names) fails validation and triggers a Pydantic AI retry
+    instead of reaching RunState unchecked."""
+
+    buyer_type: BuyerType
+    candidates: list[BuyerCandidate] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def check_types_and_uniqueness(self) -> "BuyerCandidateBatch":
+        for c in self.candidates:
+            if c.buyer_type != self.buyer_type:
+                raise ValueError(
+                    f"{c.name} is typed {c.buyer_type.value} but batch is declared {self.buyer_type.value}"
+                )
+        seen: set[str] = set()
+        for c in self.candidates:
+            key = c.name.lower()
+            if key in seen:
+                raise ValueError(f"duplicate candidate name in batch: {c.name}")
+            seen.add(key)
+        return self
+
+
 class BuyerLandscape(BaseModel):
     """Output of the synthesis agent — the final deliverable."""
 
