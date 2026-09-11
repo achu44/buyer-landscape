@@ -5,7 +5,7 @@ Validation failures are fed back to the model for retry (Pydantic AI
 does this automatically when an output fails to validate).
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
@@ -124,6 +124,43 @@ class BuyerLandscape(BaseModel):
             if b.buyer_type != BuyerType.FINANCIAL_SPONSOR:
                 raise ValueError(f"{b.name} is in sponsor_buyers but typed {b.buyer_type}")
         return self
+
+
+# ---------------------------------------------------------------------------
+# Tool outputs — what research tools hand back to an agent
+# ---------------------------------------------------------------------------
+
+class EdgarFiling(BaseModel):
+    """One hit from an EDGAR full-text search. Flattened out of EDGAR's
+    Elasticsearch envelope so an agent sees a filing it can cite, not a
+    `_source` blob it has to interpret."""
+
+    company: str = Field(min_length=1)
+    # cik and accession_number come from EDGAR and are interpolated into the
+    # document URL, so their shape is constrained rather than merely described:
+    # a hit that doesn't match is skipped instead of yielding a broken source.
+    cik: str = Field(pattern=r"^\d{10}$", description="Zero-padded 10-digit SEC CIK")
+    form: str = Field(
+        min_length=1,
+        description="This document's filing type — may be an amendment ('10-K/A') of the form searched",
+    )
+    filed_at: date
+    description: str = Field(min_length=1, description="EDGAR's label for this document, e.g. 'EX-99.1'")
+    accession_number: str = Field(pattern=r"^\d{10}-\d{2}-\d{6}$")
+    url: str = Field(description="Direct link to the document — drop this straight into `sources`")
+
+
+class EdgarSearchResults(BaseModel):
+    """Output of the `edgar_search` tool."""
+
+    query: str = Field(description="The query as sent to EDGAR, echoed so the agent can cite it")
+    total_hits: int = Field(
+        ge=0,
+        description="Filings EDGAR matched in total; may exceed len(filings), which is capped",
+    )
+    filings: list[EdgarFiling] = Field(
+        default_factory=list, description="Empty when nothing matched — that is a result, not an error"
+    )
 
 
 class RouterDecision(BaseModel):

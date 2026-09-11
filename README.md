@@ -19,10 +19,13 @@ uv add pydantic pydantic-ai tenacity httpx yfinance
 # 2. API key
 export ANTHROPIC_API_KEY=...   # put in ~/.zshrc or a .env you don't commit
 
-# 3. Claude Code (if not installed)
+# 3. Identify yourself to SEC EDGAR (it throttles anonymous traffic)
+export EDGAR_USER_AGENT="your-project-name your.email@example.com"
+
+# 4. Claude Code (if not installed)
 npm install -g @anthropic-ai/claude-code   # or: brew install claude-code
 
-# 4. Start coding
+# 5. Start coding
 git init && claude
 ```
 
