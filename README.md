@@ -22,10 +22,15 @@ export ANTHROPIC_API_KEY=...   # put in ~/.zshrc or a .env you don't commit
 # 3. Identify yourself to SEC EDGAR (it throttles anonymous traffic)
 export EDGAR_USER_AGENT="your-project-name your.email@example.com"
 
-# 4. Claude Code (if not installed)
+# 4. Web search key (optional; free tier at
+#    https://api-dashboard.search.brave.com/). Without it the run still
+#    works, sourcing evidence from EDGAR alone.
+export BRAVE_SEARCH_API_KEY=...
+
+# 5. Claude Code (if not installed)
 npm install -g @anthropic-ai/claude-code   # or: brew install claude-code
 
-# 5. Start coding
+# 6. Start coding
 git init && claude
 ```
 

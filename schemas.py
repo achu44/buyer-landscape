@@ -127,7 +127,7 @@ class BuyerLandscape(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Tool outputs — what research tools hand back to an agent
+# Tool contracts — what research tools accept and hand back
 # ---------------------------------------------------------------------------
 
 class EdgarFiling(BaseModel):
@@ -159,6 +159,53 @@ class EdgarSearchResults(BaseModel):
         description="Filings EDGAR matched in total; may exceed len(filings), which is capped",
     )
     filings: list[EdgarFiling] = Field(
+        default_factory=list, description="Empty when nothing matched — that is a result, not an error"
+    )
+
+
+class Freshness(str, Enum):
+    """How recent a web-search result has to be — an argument the model picks
+    when calling `web_search`, as an enum so it cannot invent a window the
+    search API would reject. The values are the project's own vocabulary;
+    `tools/web.py` maps them to whatever codes its provider uses."""
+
+    PAST_DAY = "past_day"
+    PAST_WEEK = "past_week"
+    PAST_MONTH = "past_month"
+    PAST_YEAR = "past_year"
+
+
+class WebSearchHit(BaseModel):
+    """One result from a general web search, flattened to the parts an agent
+    can use as evidence: text to weigh, a link to cite it from, who served it,
+    and how old the page is."""
+
+    title: str = Field(min_length=1)
+    # The URL is the whole point of a hit — it is what lands in a `sources`
+    # list — so its shape is constrained rather than merely described, and a
+    # result that doesn't match is skipped instead of cited as a dead link.
+    url: str = Field(
+        pattern=r"^https?://",
+        description="Direct link to the page — drop this straight into `sources`",
+    )
+    snippet: str = Field(
+        min_length=1,
+        description="The search engine's extract of the matching text, with markup stripped",
+    )
+    # Named `host`, not `source`: `sources` elsewhere in this file is a list of
+    # cited URLs, and one field meaning two things confuses model and reader alike.
+    host: str = Field(min_length=1, description="Host serving the page, e.g. 'www.reuters.com'")
+    published: date | None = Field(
+        default=None,
+        description="When the page was published or last updated; null when the page doesn't say",
+    )
+
+
+class WebSearchResults(BaseModel):
+    """Output of the `web_search` tool."""
+
+    query: str = Field(description="The query as sent to the search API, echoed so the agent can cite it")
+    results: list[WebSearchHit] = Field(
         default_factory=list, description="Empty when nothing matched — that is a result, not an error"
     )
 
