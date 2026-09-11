@@ -39,3 +39,13 @@ output validation, logging/observability, retries, and error handling.
 - Type hints everywhere; small functions; docstrings explain *why*.
 - Prefer boring, readable code over cleverness — this repo will be read
   by interviewers.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as GitHub issues on `achu44/buyer-landscape`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context — `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
