@@ -210,6 +210,43 @@ class WebSearchResults(BaseModel):
     )
 
 
+class CompanyComps(BaseModel):
+    """Market data for one public company, as a specialist weighs a buyer's
+    ability to pay or the multiple a comparable trades at. Every figure is
+    optional: Yahoo leaves gaps (no EBITDA for a bank, no EV for a fund), and
+    an honest null beats a guessed number an agent would quote as fact."""
+
+    ticker: str = Field(pattern=r"^[A-Z0-9][A-Z0-9.\-]{0,14}$", description="Yahoo symbol, e.g. 'MSFT' or 'SIE.DE'")
+    name: str = Field(min_length=1)
+    currency: str | None = Field(default=None, description="ISO code the figures below are quoted in")
+    sector: str | None = None
+    industry: str | None = None
+    market_cap: float | None = Field(default=None, ge=0)
+    # Can legitimately be negative for a company holding more cash than its
+    # market cap plus debt, so unlike market_cap it carries no lower bound.
+    enterprise_value: float | None = None
+    revenue_ttm: float | None = Field(default=None, ge=0, description="Trailing-twelve-month revenue")
+    ebitda_ttm: float | None = Field(default=None, description="Trailing-twelve-month EBITDA; may be negative")
+    ev_to_revenue: float | None = None
+    ev_to_ebitda: float | None = None
+    revenue_growth: float | None = Field(default=None, description="Year-over-year, as a fraction: 0.18 is 18%")
+    ebitda_margin: float | None = Field(default=None, description="As a fraction: 0.58 is 58%")
+    source_url: str = Field(
+        pattern=r"^https://finance\.yahoo\.com/quote/",
+        description="Yahoo Finance quote page — drop this straight into `sources`",
+    )
+
+
+class CompsResults(BaseModel):
+    """Output of the `comps_lookup` tool."""
+
+    companies: list[CompanyComps] = Field(default_factory=list)
+    not_found: list[str] = Field(
+        default_factory=list,
+        description="Tickers Yahoo Finance had no quote data for — likely mistyped or not publicly listed",
+    )
+
+
 class RouterDecision(BaseModel):
     """Output of the supervisor agent. This IS the dynamic routing:
     the validated enum value below is dispatched by plain Python."""
