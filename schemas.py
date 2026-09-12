@@ -237,13 +237,30 @@ class CompanyComps(BaseModel):
     )
 
 
+class SkipReason(str, Enum):
+    """Why a requested ticker is missing from `CompsResults.companies`. Kept
+    distinct because each points the agent somewhere different: fix the
+    symbol, drop it from the comp set, or source the numbers elsewhere."""
+
+    NOT_FOUND = "not_found"            # Yahoo has no quote: likely mistyped or not listed
+    NOT_A_COMPANY = "not_a_company"    # Yahoo has a quote, but not a company's (e.g. an index)
+    UNAVAILABLE = "unavailable"        # Yahoo failed or answered unreadably, after retries
+
+
+class SkippedTicker(BaseModel):
+    """One requested ticker that produced no `CompanyComps`, and why."""
+
+    ticker: str = Field(min_length=1)
+    reason: SkipReason
+
+
 class CompsResults(BaseModel):
     """Output of the `comps_lookup` tool."""
 
     companies: list[CompanyComps] = Field(default_factory=list)
-    not_found: list[str] = Field(
+    skipped: list[SkippedTicker] = Field(
         default_factory=list,
-        description="Tickers Yahoo Finance had no quote data for — likely mistyped or not publicly listed",
+        description="Requested tickers with no entry in `companies`, each with the reason",
     )
 
 

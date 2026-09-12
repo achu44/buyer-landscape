@@ -28,7 +28,7 @@ from yfinance._http import requests as yf_requests
 from yfinance.exceptions import YFRateLimitError
 
 from deps import Deps, retry_kwargs
-from schemas import CompanyComps, CompsResults
+from schemas import CompanyComps, CompsResults, SkippedTicker, SkipReason
 
 log = logging.getLogger("comps")
 
@@ -146,12 +146,13 @@ async def comps_lookup(
     Args:
         tickers: Exchange ticker symbols, not company names — e.g. ['MSFT',
             'ORCL'], or with a Yahoo suffix for a non-US listing, 'SIE.DE'.
-            Any symbol Yahoo Finance doesn't recognise comes back in
-            `not_found`.
+            A ticker that yields no data comes back in `skipped` with the
+            reason — not found, not a company, or Yahoo unavailable — while
+            the rest of the set is still returned.
     """
     deps = ctx.deps
     companies: list[CompanyComps] = []
-    not_found: list[str] = []
+    skipped: list[SkippedTicker] = []
     # Yahoo symbols are case-insensitive; normalising here keeps a loosely
     # written or repeated peer from costing a retry or a duplicate row.
     for ticker in dict.fromkeys(t.strip().upper() for t in tickers):
@@ -163,17 +164,20 @@ async def comps_lookup(
             # should crash the agent run. If the error was transient the retries
             # already ran to exhaustion; if not, it was never going to improve.
             # Either way terminal, and the agent should fall back.
-            reason = "is unavailable" if _is_transient(exc) else "returned data yfinance could not read"
+            # Either way it is terminal for this ticker only: the rest of the
+            # comp set is still worth returning (ADR 0003).
             log.warning(
-                "comps lookup failed: run_id=%s ticker=%s error=%r", deps.run_id, ticker, exc
+                "comps lookup failed: run_id=%s ticker=%s transient=%s error=%r",
+                deps.run_id, ticker, _is_transient(exc), exc,
             )
-            raise ToolFailed(f"Yahoo Finance {reason} ({exc!r}). {_FALL_BACK}") from exc
+            skipped.append(SkippedTicker(ticker=ticker, reason=SkipReason.UNAVAILABLE))
+            continue
         if not info.get("quoteType"):
             # yfinance logs Yahoo's 404 and hands back a near-empty dict rather
             # than raising, so a missing quote type is how "no such symbol"
             # shows up. One typo costs one company, named so the agent can fix it.
             log.info("comps ticker not found: run_id=%s ticker=%s", deps.run_id, ticker)
-            not_found.append(ticker)
+            skipped.append(SkippedTicker(ticker=ticker, reason=SkipReason.NOT_FOUND))
             continue
         try:
             companies.append(_comps_from_info(ticker, info))
@@ -185,18 +189,25 @@ async def comps_lookup(
                 "skipping unusable comps quote: run_id=%s ticker=%s error=%s",
                 deps.run_id, ticker, exc.errors(include_url=False),
             )
-            not_found.append(ticker)
+            skipped.append(SkippedTicker(ticker=ticker, reason=SkipReason.NOT_A_COMPANY))
 
     if not companies:
-        # Nothing recognised at all is almost always company names or invented
+        tickers_tried = [s.ticker for s in skipped]
+        if any(s.reason == SkipReason.UNAVAILABLE for s in skipped):
+            # Yahoo itself failed, so nothing the model rewrites will help.
+            raise ToolFailed(
+                f"Yahoo Finance could not supply data for {tickers_tried!r}. {_FALL_BACK}"
+            )
+        # Nothing usable at all is almost always company names or invented
         # symbols rather than a real gap in Yahoo's coverage — fixable by the
         # model, and an empty result would read as "no market data exists".
         raise ModelRetry(
-            f"Yahoo Finance recognised none of {not_found!r}. Pass exchange ticker symbols "
-            "(e.g. 'MSFT', or 'SIE.DE' for a non-US listing), not company names, and try again."
+            f"Yahoo Finance had no listed company for any of {tickers_tried!r}. Pass exchange "
+            "ticker symbols for companies (e.g. 'MSFT', or 'SIE.DE' for a non-US listing) — "
+            "not company names or indices — and try again."
         )
     log.info(
-        "comps lookup completed: run_id=%s returned=%d not_found=%s",
-        deps.run_id, len(companies), not_found,
+        "comps lookup completed: run_id=%s returned=%d skipped=%s",
+        deps.run_id, len(companies), [(s.ticker, s.reason.value) for s in skipped],
     )
-    return CompsResults(companies=companies, not_found=not_found)
+    return CompsResults(companies=companies, skipped=skipped)

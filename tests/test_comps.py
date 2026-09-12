@@ -26,7 +26,7 @@ from yfinance.exceptions import YFDataException, YFRateLimitError
 import deps
 import tools.comps
 from deps import MAX_ATTEMPTS, Deps, build_deps
-from schemas import CompanyComps, CompsResults
+from schemas import CompanyComps, CompsResults, SkippedTicker, SkipReason
 from tools.comps import MAX_TICKERS, comps_lookup
 
 RUN_ID = "run-abc123"
@@ -153,7 +153,7 @@ def test_parses_a_ticker_into_structured_comps(monkeypatch: pytest.MonkeyPatch):
     assert msft.revenue_growth == 0.177
     assert msft.ebitda_margin == 0.58534
     assert msft.source_url == "https://finance.yahoo.com/quote/MSFT"
-    assert results.not_found == []
+    assert results.skipped == []
 
 
 def test_normalises_how_the_model_wrote_a_ticker(monkeypatch: pytest.MonkeyPatch):
@@ -216,7 +216,7 @@ def test_an_unknown_ticker_is_reported_without_losing_the_rest_of_the_set(
     results = run(comps_lookup(make_ctx(), tickers=["MSFT", "ZZZZNOTREAL"]))
 
     assert [c.ticker for c in results.companies] == ["MSFT"]
-    assert results.not_found == ["ZZZZNOTREAL"]
+    assert results.skipped == [SkippedTicker(ticker="ZZZZNOTREAL", reason=SkipReason.NOT_FOUND)]
 
 
 def test_a_quote_that_is_not_a_usable_company_is_skipped_not_fatal(monkeypatch: pytest.MonkeyPatch):
@@ -229,7 +229,7 @@ def test_a_quote_that_is_not_a_usable_company_is_skipped_not_fatal(monkeypatch: 
     results = run(comps_lookup(make_ctx(), tickers=["MSFT", "^GSPC"]))
 
     assert [c.ticker for c in results.companies] == ["MSFT"]
-    assert results.not_found == ["^GSPC"]
+    assert results.skipped == [SkippedTicker(ticker="^GSPC", reason=SkipReason.NOT_A_COMPANY)]
 
 
 def test_asks_the_model_to_retry_when_no_ticker_is_recognised(monkeypatch: pytest.MonkeyPatch):
@@ -278,6 +278,22 @@ def test_reports_a_terminal_failure_after_the_retries_are_exhausted(monkeypatch:
         run(comps_lookup(make_ctx(), tickers=["MSFT"]))
 
     assert stub.calls["MSFT"] == MAX_ATTEMPTS
+
+
+def test_one_unavailable_ticker_does_not_lose_the_rest_of_the_set(monkeypatch: pytest.MonkeyPatch):
+    """A lookup that keeps failing for one ticker costs that ticker, named as
+    unavailable, not the companies already fetched — ADR 0003 rejects losing a
+    partial answer over one dead source."""
+    stub = stub_yahoo(
+        monkeypatch,
+        {"MSFT": [msft_info()], "ORCL": [yf_requests.exceptions.ConnectTimeout("always fails")]},
+    )
+
+    results = run(comps_lookup(make_ctx(), tickers=["MSFT", "ORCL"]))
+
+    assert [c.ticker for c in results.companies] == ["MSFT"]
+    assert results.skipped == [SkippedTicker(ticker="ORCL", reason=SkipReason.UNAVAILABLE)]
+    assert stub.calls["ORCL"] == MAX_ATTEMPTS
 
 
 @pytest.mark.parametrize(
