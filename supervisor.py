@@ -31,6 +31,7 @@ from schemas import (
     name_key,
 )
 from tools.comps import comps_lookup
+from tools.crm import write_to_crm
 from tools.edgar import edgar_search
 from tools.web import web_search
 
@@ -391,6 +392,63 @@ async def _deepen_research(state: RunState, deps: Deps) -> None:
             state.errors.append(f"deepen_research ({buyer_type.value}): {exc}")
 
 
+async def _write_landscape_to_crm(state: RunState, deps: Deps) -> None:
+    """Persist the run's finished landscape to the mock CRM.
+
+    The already-written guardrail comes first because the writer always
+    appends a fresh Account: a router that asks twice would otherwise log one
+    run as two analyses. Raises when there is nothing to write; the caller
+    records the error and the router re-routes to synthesis.
+    """
+    if state.crm_written:
+        state.errors.append("write_to_crm requested but the CRM is already written; ignoring")
+        return
+
+    if state.landscape is None:
+        raise RuntimeError("no landscape yet; synthesize before writing to the CRM")
+
+    # sqlite3 blocks; a thread keeps the event loop (and the shared HTTP
+    # client living on it) free while the write runs.
+    await asyncio.to_thread(write_to_crm, state.landscape, state.run_id, deps.crm_db_path)
+    state.crm_written = True
+    log.info("landscape written to crm: db=%s run_id=%s", deps.crm_db_path, state.run_id)
+
+
+async def dispatch(state: RunState, deps: Deps, step: NextStep) -> None:
+    """Execute one routed step against the run state.
+
+    Separate from the routing loop so any step can be run on its own against
+    a hand-seeded state — writing a landscape to the CRM should not need a
+    profile, two specialists and a synthesis run first to be exercised.
+    Raises on failure; the loop owns turning that into a routable error.
+    """
+    if step == NextStep.DONE:
+        return
+
+    elif step == NextStep.PROFILE_TARGET:
+        state.profile = (await profiler_agent.run(state.target_input, deps=deps)).output
+
+    elif step == NextStep.FIND_STRATEGIC_BUYERS:
+        await _source_buyers(state, deps, BuyerType.STRATEGIC)
+
+    elif step == NextStep.FIND_SPONSOR_BUYERS:
+        await _source_buyers(state, deps, BuyerType.FINANCIAL_SPONSOR)
+
+    elif step == NextStep.DEEPEN_RESEARCH:
+        await _deepen_research(state, deps)
+
+    elif step == NextStep.SYNTHESIZE:
+        prompt = (
+            f"PROFILE:\n{state.profile.model_dump_json() if state.profile else 'MISSING'}\n\n"
+            f"STRATEGIC:\n{[b.model_dump() for b in state.strategic_buyers]}\n\n"
+            f"SPONSORS:\n{[b.model_dump() for b in state.sponsor_buyers]}"
+        )
+        state.landscape = (await synthesis_agent.run(prompt)).output
+
+    elif step == NextStep.WRITE_TO_CRM:
+        await _write_landscape_to_crm(state, deps)
+
+
 async def _run(target_input: str) -> RunState:
     state = RunState(run_id=uuid.uuid4().hex[:8], target_input=target_input)
     deps = build_deps(state.run_id)
@@ -405,35 +463,11 @@ async def _run(target_input: str) -> RunState:
             )
             state.steps_taken.append(decision.next_step.value)
 
+            if decision.next_step == NextStep.DONE:
+                break
+
             try:
-                if decision.next_step == NextStep.DONE:
-                    break
-
-                elif decision.next_step == NextStep.PROFILE_TARGET:
-                    state.profile = (
-                        await profiler_agent.run(target_input, deps=deps)
-                    ).output
-
-                elif decision.next_step == NextStep.FIND_STRATEGIC_BUYERS:
-                    await _source_buyers(state, deps, BuyerType.STRATEGIC)
-
-                elif decision.next_step == NextStep.FIND_SPONSOR_BUYERS:
-                    await _source_buyers(state, deps, BuyerType.FINANCIAL_SPONSOR)
-
-                elif decision.next_step == NextStep.DEEPEN_RESEARCH:
-                    await _deepen_research(state, deps)
-
-                elif decision.next_step == NextStep.SYNTHESIZE:
-                    prompt = (
-                        f"PROFILE:\n{state.profile.model_dump_json() if state.profile else 'MISSING'}\n\n"
-                        f"STRATEGIC:\n{[b.model_dump() for b in state.strategic_buyers]}\n\n"
-                        f"SPONSORS:\n{[b.model_dump() for b in state.sponsor_buyers]}"
-                    )
-                    state.landscape = (await synthesis_agent.run(prompt)).output
-
-                elif decision.next_step == NextStep.WRITE_TO_CRM:
-                    ...  # crm.write_landscape(state.landscape); state.crm_written = True
-
+                await dispatch(state, deps, decision.next_step)
             except Exception as exc:  # noqa: BLE001 — degrade, don't crash
                 log.exception("step failed: %s (run_id=%s)", decision.next_step, state.run_id)
                 state.errors.append(f"{decision.next_step.value}: {exc}")
