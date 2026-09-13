@@ -210,6 +210,87 @@ class WebSearchResults(BaseModel):
     )
 
 
+# Longest Yahoo symbol accepted — shared by CompanyComps.ticker and the
+# `comps_lookup` argument so the two limits cannot drift apart.
+TICKER_MAX_CHARS = 15
+
+
+class CompanyComps(BaseModel):
+    """Market data for one public company, as a specialist weighs a buyer's
+    ability to pay or the multiple a comparable trades at. Every figure is
+    optional: Yahoo leaves gaps (no EBITDA for a bank, no EV for a fund), and
+    an honest null beats a guessed number an agent would quote as fact."""
+
+    ticker: str = Field(
+        pattern=rf"^[A-Z0-9][A-Z0-9.\-]{{0,{TICKER_MAX_CHARS - 1}}}$",
+        description="Yahoo symbol, e.g. 'MSFT' or 'SIE.DE'",
+    )
+    name: str = Field(min_length=1)
+    # Two currencies, because a cross-listed company trades in one and reports
+    # in another: TSM is quoted in USD but reports in TWD.
+    quote_currency: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Unit the share price is quoted in — usually ISO, but e.g. 'GBp' (pence) in London",
+    )
+    financial_currency: str | None = Field(
+        default=None,
+        pattern=r"^[A-Z]{3}$",
+        description="ISO code of the reported figures: revenue_ttm and ebitda_ttm",
+    )
+    sector: str | None = Field(default=None, min_length=1)
+    industry: str | None = Field(default=None, min_length=1)
+    market_cap: float | None = Field(
+        default=None,
+        ge=0,
+        description="As Yahoo reports it; for a cross-listed company check it against financial_currency before comparing",
+    )
+    # Can legitimately be negative for a company holding more cash than its
+    # market cap plus debt, so unlike market_cap it carries no lower bound.
+    enterprise_value: float | None = None
+    revenue_ttm: float | None = Field(
+        default=None, ge=0, description="Trailing-twelve-month revenue, in financial_currency"
+    )
+    ebitda_ttm: float | None = Field(
+        default=None, description="Trailing-twelve-month EBITDA, in financial_currency; may be negative"
+    )
+    ev_to_revenue: float | None = None
+    ev_to_ebitda: float | None = None
+    revenue_growth: float | None = Field(default=None, description="Year-over-year, as a fraction: 0.18 is 18%")
+    ebitda_margin: float | None = Field(default=None, description="As a fraction: 0.58 is 58%")
+    source_url: str = Field(
+        pattern=r"^https://finance\.yahoo\.com/quote/",
+        description="Yahoo Finance quote page — drop this straight into `sources`",
+    )
+
+
+class SkipReason(str, Enum):
+    """Why a requested ticker is missing from `CompsResults.companies`. Kept
+    distinct because each points the agent somewhere different: fix the
+    symbol, drop it from the comp set, or source the numbers elsewhere."""
+
+    NOT_FOUND = "not_found"            # Yahoo has no quote: likely mistyped or not listed
+    NOT_A_COMPANY = "not_a_company"    # Yahoo has a quote, but not a company's (e.g. an index)
+    UNAVAILABLE = "unavailable"        # Yahoo failed or answered unreadably, after retries
+
+
+class SkippedTicker(BaseModel):
+    """One requested ticker that produced no `CompanyComps`, and why."""
+
+    ticker: str = Field(min_length=1)
+    reason: SkipReason
+
+
+class CompsResults(BaseModel):
+    """Output of the `comps_lookup` tool."""
+
+    companies: list[CompanyComps] = Field(default_factory=list)
+    skipped: list[SkippedTicker] = Field(
+        default_factory=list,
+        description="Requested tickers with no entry in `companies`, each with the reason",
+    )
+
+
 class RouterDecision(BaseModel):
     """Output of the supervisor agent. This IS the dynamic routing:
     the validated enum value below is dispatched by plain Python."""
