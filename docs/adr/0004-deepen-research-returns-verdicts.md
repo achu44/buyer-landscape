@@ -9,9 +9,12 @@ each stating `confirmed` or `refuted` plus the evidence behind it, and the
 rewritten `BuyerCandidate` only when confirmed. Model validators tie the two
 together: a confirmation without a buyer, a refutation carrying one, or a
 confirmation that renames the buyer all fail validation and go back to the
-model. The supervisor then drops any low-confidence candidate the pass
-confirmed nothing for — refuted or unreported alike — so the list that
-survives a round carries no unevidenced names.
+model. The supervisor holds a pass to the candidates it was handed — findings
+about names nobody asked about, or a candidate left unanswered, fail the whole
+pass rather than being merged — and then drops any low-confidence candidate
+the pass confirmed nothing for, so the list that survives a round carries no
+unevidenced names. Dropping an unreported name is the last line of defense
+behind that check, not the everyday path.
 
 **One round deepens every list that needs it.** `_deepen_research` collects
 the buyer types with low-confidence candidates and runs each list's pass

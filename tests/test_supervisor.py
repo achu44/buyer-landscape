@@ -82,7 +82,7 @@ def confirms(
         "original_name": name,
         "verdict": "confirmed",
         "evidence": EVIDENCE,
-        "candidate": candidate(name, buyer_type, confidence),
+        "confirmed_candidate": candidate(name, buyer_type, confidence),
     }
 
 
@@ -464,4 +464,56 @@ def test_a_failed_deepen_pass_leaves_the_other_list_deepened() -> None:
     )
 
     assert any("deepen_research (strategic)" in e for e in state.errors)
+    assert [b.name for b in state.strategic_buyers] == ["Air Liquide"]  # kept, not dropped
     assert [b.name for b in state.sponsor_buyers] == ["Apollo"]
+
+
+def test_the_round_cap_holds_when_both_lists_need_deepening() -> None:
+    """The cap bounds rounds, not agent runs: two lists needing work get the
+    same number of attempts each as one list would, and no more."""
+    strategic_deepen = Responder(
+        deepened(
+            BuyerType.STRATEGIC,
+            confirms("Air Liquide", BuyerType.STRATEGIC, "low"),
+        )
+    )
+    sponsor_deepen = Responder(
+        deepened(
+            BuyerType.FINANCIAL_SPONSOR,
+            confirms("Apollo", BuyerType.FINANCIAL_SPONSOR, "low"),
+        )
+    )
+
+    state = sourced_then_deepened(
+        strategic=batch_of(
+            BuyerType.STRATEGIC, candidate("Air Liquide", BuyerType.STRATEGIC, "low")
+        ),
+        sponsor=batch_of(
+            BuyerType.FINANCIAL_SPONSOR,
+            candidate("Apollo", BuyerType.FINANCIAL_SPONSOR, "low"),
+        ),
+        rounds=supervisor.MAX_DEEPEN_ROUNDS + 2,
+        strategic_deepen_agent=strategic_deepen,
+        sponsor_deepen_agent=sponsor_deepen,
+    )
+
+    assert strategic_deepen.calls == supervisor.MAX_DEEPEN_ROUNDS
+    assert sponsor_deepen.calls == supervisor.MAX_DEEPEN_ROUNDS
+    assert state.deepen_rounds_used == supervisor.MAX_DEEPEN_ROUNDS
+
+
+def test_a_pass_answering_about_the_wrong_candidates_keeps_the_list() -> None:
+    """Every unanswered candidate is dropped, so a pass that reports on names
+    nobody asked about would delete the list it was called to resolve. It is
+    rejected instead, and the router sees the error."""
+    state = sourced_then_deepened(
+        strategic=batch_of(
+            BuyerType.STRATEGIC, candidate("Air Liquide", BuyerType.STRATEGIC, "low")
+        ),
+        strategic_deepen_agent=Responder(
+            deepened(BuyerType.STRATEGIC, confirms("Linde", BuyerType.STRATEGIC))
+        ),
+    )
+
+    assert [b.name for b in state.strategic_buyers] == ["Air Liquide"]
+    assert any("wrong candidates" in e for e in state.errors)

@@ -1,10 +1,11 @@
 """Unit tests for schemas.py. No agent or network calls — pure validation."""
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
 from schemas import (
-    MAX_DEEPEN_ROUNDS,
     BuyerCandidate,
     BuyerCandidateBatch,
     BuyerType,
@@ -38,7 +39,7 @@ def make_candidate(
     )
 
 
-def make_state(**kwargs) -> RunState:
+def make_state(**kwargs: Any) -> RunState:
     return RunState(run_id="run-test01", target_input="Chart Industries", **kwargs)
 
 
@@ -88,15 +89,12 @@ def test_router_summary_reports_low_confidence_across_both_lists():
         ],
     )
 
-    assert "Low-confidence buyers across both lists: 2" in state.summary_for_router()
+    assert "Low-confidence buyers across both lists: 2" in state.summary_for_router(2)
 
 
-def test_router_summary_quotes_the_configured_round_cap():
-    """The cap the router is told about is the cap the loop enforces."""
-    assert (
-        f"Deepen-research rounds used: 0 of {MAX_DEEPEN_ROUNDS}"
-        in make_state().summary_for_router()
-    )
+def test_router_summary_quotes_the_cap_it_is_given():
+    """The router is told the cap its caller enforces, not a literal."""
+    assert "Deepen-research rounds used: 0 of 3" in make_state().summary_for_router(3)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +113,7 @@ def confirmed(name: str, buyer_type: BuyerType = BuyerType.STRATEGIC,
         original_name=name,
         verdict=DeepenVerdict.CONFIRMED,
         evidence=EVIDENCE,
-        candidate=make_candidate(name, buyer_type, confidence),
+        confirmed_candidate=make_candidate(name, buyer_type, confidence),
     )
 
 
@@ -142,7 +140,7 @@ def test_refuted_finding_must_not_carry_a_buyer():
             original_name="Acme Corp",
             verdict=DeepenVerdict.REFUTED,
             evidence=EVIDENCE,
-            candidate=make_candidate("Acme Corp"),
+            confirmed_candidate=make_candidate("Acme Corp"),
         )
 
 
@@ -153,7 +151,7 @@ def test_confirmed_finding_must_keep_the_original_name():
             original_name="Acme Corp",
             verdict=DeepenVerdict.CONFIRMED,
             evidence=EVIDENCE,
-            candidate=make_candidate("Acme Holdings"),
+            confirmed_candidate=make_candidate("Acme Holdings"),
         )
 
 
@@ -201,7 +199,11 @@ def test_refuted_candidate_is_dropped():
 
 
 def test_low_confidence_candidate_the_pass_ignored_is_dropped():
-    """Silence is not substantiation — an unreported name leaves too."""
+    """Silence is not substantiation — an unreported name leaves too.
+
+    The supervisor rejects a pass that skips a candidate before it gets here,
+    so this is the last line of defense rather than the everyday path.
+    """
     state = make_state(
         strategic_buyers=[
             make_candidate("Acme Corp", confidence=Confidence.LOW),
@@ -226,3 +228,22 @@ def test_deepening_one_list_leaves_the_other_alone():
 
     assert state.strategic_buyers == []
     assert [b.name for b in state.sponsor_buyers] == ["Apollo"]
+
+
+def test_confirmation_keeps_the_name_the_buyer_was_sourced_under():
+    """Names match case-insensitively, so a re-typed confirmation must not
+    rename the buyer in the landscape."""
+    state = make_state(
+        strategic_buyers=[make_candidate("Air Liquide", confidence=Confidence.LOW)]
+    )
+    retyped = DeepenedCandidate(
+        original_name="air liquide",
+        verdict=DeepenVerdict.CONFIRMED,
+        evidence=EVIDENCE,
+        confirmed_candidate=make_candidate("air liquide"),
+    )
+
+    state.apply_deepening(BuyerType.STRATEGIC, [retyped])
+
+    assert [b.name for b in state.strategic_buyers] == ["Air Liquide"]
+    assert state.strategic_buyers[0].confidence is Confidence.HIGH

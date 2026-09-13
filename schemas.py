@@ -40,6 +40,17 @@ class NextStep(str, Enum):
     DONE = "done"
 
 
+def name_key(name: str) -> str:
+    """How two buyer names are matched.
+
+    Buyer names travel between agents as free text, and the same buyer comes
+    back spaced or cased differently often enough that matching on the raw
+    string would duplicate a candidate here and fail to replace one there.
+    One spelling of the rule so every match in this file agrees.
+    """
+    return name.strip().lower()
+
+
 # ---------------------------------------------------------------------------
 # Agent outputs
 # ---------------------------------------------------------------------------
@@ -97,7 +108,7 @@ class BuyerCandidateBatch(BaseModel):
                 )
         seen: set[str] = set()
         for c in self.candidates:
-            key = c.name.lower()
+            key = name_key(c.name)
             if key in seen:
                 raise ValueError(f"duplicate candidate name in batch: {c.name}")
             seen.add(key)
@@ -133,7 +144,7 @@ class DeepenedCandidate(BaseModel):
         min_length=80,
         description="What the pass found: the confirming evidence, or why the name could not be substantiated",
     )
-    candidate: BuyerCandidate | None = Field(
+    confirmed_candidate: BuyerCandidate | None = Field(
         default=None,
         description="The re-researched buyer, carrying the new evidence. Required when confirmed; omit when refuted",
     )
@@ -141,20 +152,20 @@ class DeepenedCandidate(BaseModel):
     @model_validator(mode="after")
     def check_verdict_matches_candidate(self) -> "DeepenedCandidate":
         if self.verdict is DeepenVerdict.REFUTED:
-            if self.candidate is not None:
+            if self.confirmed_candidate is not None:
                 raise ValueError(
                     f"{self.original_name} is refuted but carries a candidate; a refuted buyer is dropped"
                 )
             return self
-        if self.candidate is None:
+        if self.confirmed_candidate is None:
             raise ValueError(
                 f"{self.original_name} is confirmed but carries no candidate; return the re-researched buyer"
             )
         # The name is what the merge matches on, so a confirmation that renames
         # the buyer would have nothing to replace and would read as a new one.
-        if self.candidate.name.strip().lower() != self.original_name.strip().lower():
+        if name_key(self.confirmed_candidate.name) != name_key(self.original_name):
             raise ValueError(
-                f"confirmed candidate is named {self.candidate.name!r} but re-researched "
+                f"confirmed candidate is named {self.confirmed_candidate.name!r} but re-researched "
                 f"{self.original_name!r}; keep the original name"
             )
         return self
@@ -176,13 +187,14 @@ class DeepenedBatch(BaseModel):
     def check_types_and_uniqueness(self) -> "DeepenedBatch":
         seen: set[str] = set()
         for f in self.findings:
-            key = f.original_name.strip().lower()
+            key = name_key(f.original_name)
             if key in seen:
                 raise ValueError(f"two findings for the same candidate: {f.original_name}")
             seen.add(key)
-            if f.candidate is not None and f.candidate.buyer_type != self.buyer_type:
+            buyer = f.confirmed_candidate
+            if buyer is not None and buyer.buyer_type != self.buyer_type:
                 raise ValueError(
-                    f"{f.candidate.name} is typed {f.candidate.buyer_type.value} but batch is "
+                    f"{buyer.name} is typed {buyer.buyer_type.value} but batch is "
                     f"declared {self.buyer_type.value}"
                 )
         return self
@@ -387,11 +399,6 @@ class RouterDecision(BaseModel):
 # Run state — passed to the supervisor each iteration
 # ---------------------------------------------------------------------------
 
-# The deepen-research cap lives here, next to the state that reports it, so the
-# number the router is told about is the same one the supervisor enforces.
-MAX_DEEPEN_ROUNDS = 2
-
-
 class RunState(BaseModel):
     """Everything the supervisor can see when deciding the next step.
     Keep it summarizable: the router prompt gets a compact rendering of this."""
@@ -417,10 +424,7 @@ class RunState(BaseModel):
         twice. Deepening low-confidence buyers is its own step, and updates
         them in place (CONTEXT.md).
         """
-        if buyer_type is BuyerType.STRATEGIC:
-            self.strategic_buyers = list(candidates)
-        else:
-            self.sponsor_buyers = list(candidates)
+        self.buyers_for(buyer_type)[:] = candidates
 
     def apply_deepening(
         self, buyer_type: BuyerType, findings: list[DeepenedCandidate]
@@ -435,18 +439,21 @@ class RunState(BaseModel):
         and order is preserved so the list still reads as it was sourced.
         """
         confirmed = {
-            f.original_name.strip().lower(): f.candidate
+            name_key(f.original_name): f.confirmed_candidate
             for f in findings
-            if f.verdict is DeepenVerdict.CONFIRMED and f.candidate is not None
+            if f.verdict is DeepenVerdict.CONFIRMED and f.confirmed_candidate is not None
         }
         kept: list[BuyerCandidate] = []
         for existing in self.buyers_for(buyer_type):
             if existing.confidence is not Confidence.LOW:
                 kept.append(existing)
                 continue
-            replacement = confirmed.get(existing.name.strip().lower())
+            replacement = confirmed.get(name_key(existing.name))
             if replacement is not None:
-                kept.append(replacement)
+                # Names match case- and space-insensitively, so a pass that
+                # re-types one would otherwise rename the buyer in the
+                # landscape. Keep the spelling it was sourced under.
+                kept.append(replacement.model_copy(update={"name": existing.name}))
         self.record_buyers(buyer_type, kept)
 
     def buyers_for(self, buyer_type: BuyerType) -> list[BuyerCandidate]:
@@ -468,7 +475,13 @@ class RunState(BaseModel):
         """
         return sum(len(self.low_confidence_buyers(bt)) for bt in BuyerType)
 
-    def summary_for_router(self) -> str:
+    def summary_for_router(self, deepen_round_cap: int) -> str:
+        """Render the state for the router prompt.
+
+        The cap is passed in rather than read from here: the supervisor owns
+        the guardrail, and taking it as an argument means the number quoted to
+        the router cannot drift from the one the loop enforces.
+        """
         return (
             f"Target input: {self.target_input}\n"
             f"Profile built: {self.profile is not None}\n"
@@ -479,7 +492,7 @@ class RunState(BaseModel):
             f"Low-confidence buyers across both lists: {self.low_confidence_count()}\n"
             f"Landscape synthesized: {self.landscape is not None}\n"
             f"CRM written: {self.crm_written}\n"
-            f"Deepen-research rounds used: {self.deepen_rounds_used} of {MAX_DEEPEN_ROUNDS}\n"
+            f"Deepen-research rounds used: {self.deepen_rounds_used} of {deepen_round_cap}\n"
             f"Steps so far: {', '.join(self.steps_taken) or 'none'}\n"
             f"Errors so far: {'; '.join(self.errors) or 'none'}"
         )

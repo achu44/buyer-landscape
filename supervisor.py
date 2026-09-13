@@ -19,7 +19,6 @@ from pydantic_ai import Agent, ModelRetry, RunContext
 
 from deps import Deps, build_deps
 from schemas import (
-    MAX_DEEPEN_ROUNDS,
     BuyerCandidate,
     BuyerCandidateBatch,
     BuyerLandscape,
@@ -29,6 +28,7 @@ from schemas import (
     RouterDecision,
     RunState,
     TargetProfile,
+    name_key,
 )
 from tools.comps import comps_lookup
 from tools.edgar import edgar_search
@@ -41,9 +41,7 @@ logging.basicConfig(
 log = logging.getLogger("supervisor")
 
 MAX_ITERATIONS = 12       # hard cap: the loop can never run away
-
-# MAX_DEEPEN_ROUNDS is defined in schemas.py, next to the RunState that quotes
-# it to the router, and re-exported here because this module is where it bites.
+MAX_DEEPEN_ROUNDS = 2     # low-confidence re-research is bounded
 
 MODEL = "anthropic:claude-sonnet-4-6"  # pick per docs; cheap+fast is fine here
 
@@ -138,25 +136,33 @@ SPONSOR_INSTRUCTIONS = (
 )
 
 
-def build_specialist_agent(
-    buyer_type: BuyerType, instructions: str
-) -> Agent[Deps, BuyerCandidateBatch]:
-    """Build one buyer-sourcing specialist.
+def build_buyer_agent[OutputT](
+    output_type: type[OutputT], instructions: str
+) -> Agent[Deps, OutputT]:
+    """The wiring every buyer-facing agent shares.
 
-    Strategic and sponsor sourcing differ in what the model is told to look
-    for and in the buyer type it must come back with — never in wiring. One
-    construction path so a tool added here reaches both, rather than two
-    near-copies that drift apart.
+    Sourcing strategic buyers, sourcing sponsors and re-researching either
+    list differ in what the model is told to look for and in what it must
+    hand back — never in wiring. One construction path so a tool or a retry
+    setting added here reaches all four, rather than near-copies that drift
+    apart.
     """
-    agent = Agent(
+    return Agent(
         MODEL,
         deps_type=Deps,
-        output_type=BuyerCandidateBatch,
+        output_type=output_type,
         instructions=instructions,
         tools=RESEARCH_TOOLS,
         retries=2,
         defer_model_check=True,
     )
+
+
+def build_specialist_agent(
+    buyer_type: BuyerType, instructions: str
+) -> Agent[Deps, BuyerCandidateBatch]:
+    """Build one buyer-sourcing specialist, held to the type it was asked for."""
+    agent = build_buyer_agent(BuyerCandidateBatch, instructions)
 
     @agent.output_validator
     def check_batch_matches_agent(
@@ -211,23 +217,15 @@ DEEPEN_INSTRUCTIONS = (
 def build_deepen_agent(buyer_type: BuyerType) -> Agent[Deps, DeepenedBatch]:
     """Build the deepen-research pass for one buyer list.
 
-    Same shape as `build_specialist_agent`, and separate from it because the
-    two ask the model for different things: a specialist returns buyers, this
-    returns verdicts on buyers it was handed. One agent per buyer type so the
-    output validator can hold the batch to the list it was run against.
+    Separate from `build_specialist_agent` because the two ask the model for
+    different things: a specialist returns buyers, this returns verdicts on
+    buyers it was handed. One agent per buyer type so the output validator can
+    hold the findings to the list they were run against.
     """
-    agent = Agent(
-        MODEL,
-        deps_type=Deps,
-        output_type=DeepenedBatch,
-        instructions=DEEPEN_INSTRUCTIONS,
-        tools=RESEARCH_TOOLS,
-        retries=2,
-        defer_model_check=True,
-    )
+    agent = build_buyer_agent(DeepenedBatch, DEEPEN_INSTRUCTIONS)
 
     @agent.output_validator
-    def check_batch_matches_agent(
+    def check_findings_match_agent(
         ctx: RunContext[Deps], batch: DeepenedBatch
     ) -> DeepenedBatch:
         """Reject findings filed against the wrong list.
@@ -334,6 +332,18 @@ async def _deepen_one_list(
             f"deepen pass for {buyer_type.value} returned {batch.buyer_type.value} findings"
         )
 
+    # A candidate nothing came back for is dropped, so a pass that answers
+    # about the wrong names would quietly delete the list it was meant to
+    # resolve. Failing here costs the round and keeps the candidates, which
+    # the router can see and act on; a silent deletion it could not.
+    asked = {name_key(c.name) for c in targets}
+    answered = {name_key(f.original_name) for f in batch.findings}
+    if answered != asked:
+        raise RuntimeError(
+            f"deepen pass for {buyer_type.value} answered about the wrong candidates: "
+            f"unasked={sorted(answered - asked)}, unanswered={sorted(asked - answered)}"
+        )
+
     before = len(state.buyers_for(buyer_type))
     state.apply_deepening(buyer_type, batch.findings)
     after = len(state.buyers_for(buyer_type))
@@ -388,7 +398,7 @@ async def _run(target_input: str) -> RunState:
 
     try:
         for iteration in range(MAX_ITERATIONS):
-            decision = (await router_agent.run(state.summary_for_router())).output
+            decision = (await router_agent.run(state.summary_for_router(MAX_DEEPEN_ROUNDS))).output
             log.info(
                 "routing: iter=%d step=%s reason=%r run_id=%s",
                 iteration, decision.next_step.value, decision.reason, state.run_id,
