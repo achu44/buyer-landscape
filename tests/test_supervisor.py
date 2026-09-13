@@ -10,8 +10,8 @@ instructions.
 
 import asyncio
 from contextlib import ExitStack
-import sqlite3
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 import pytest
@@ -591,6 +591,8 @@ def test_write_to_crm_persists_the_landscape_and_marks_the_run_written(
         ("KKR", "financial_sponsor"),
         ("Linde", "strategic"),
     ]
+    # One Note per Opportunity, plus the summary Note on the Account.
+    assert crm_rows(crm_db, "SELECT COUNT(*) FROM notes") == [(6,)]
     assert state.crm_written is True
     assert state.errors == []
 

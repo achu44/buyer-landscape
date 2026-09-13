@@ -411,7 +411,6 @@ async def _write_landscape_to_crm(state: RunState, deps: Deps) -> None:
     # client living on it) free while the write runs.
     await asyncio.to_thread(write_to_crm, state.landscape, state.run_id, deps.crm_db_path)
     state.crm_written = True
-    log.info("landscape written to crm: db=%s run_id=%s", deps.crm_db_path, state.run_id)
 
 
 async def dispatch(state: RunState, deps: Deps, step: NextStep) -> None:
@@ -420,12 +419,10 @@ async def dispatch(state: RunState, deps: Deps, step: NextStep) -> None:
     Separate from the routing loop so any step can be run on its own against
     a hand-seeded state — writing a landscape to the CRM should not need a
     profile, two specialists and a synthesis run first to be exercised.
-    Raises on failure; the loop owns turning that into a routable error.
+    Raises on failure; the loop owns turning that into a routable error, and
+    owns `DONE` too, since finishing is a loop decision rather than a step.
     """
-    if step == NextStep.DONE:
-        return
-
-    elif step == NextStep.PROFILE_TARGET:
+    if step == NextStep.PROFILE_TARGET:
         state.profile = (await profiler_agent.run(state.target_input, deps=deps)).output
 
     elif step == NextStep.FIND_STRATEGIC_BUYERS:
