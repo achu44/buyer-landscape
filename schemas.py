@@ -318,6 +318,21 @@ class RunState(BaseModel):
     steps_taken: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
+    def record_buyers(
+        self, buyer_type: BuyerType, candidates: list[BuyerCandidate]
+    ) -> None:
+        """File a specialist's candidates under the list for their buyer type.
+
+        Replaces rather than appends: a re-run of a sourcing step re-sources
+        that list from scratch, so appending would duplicate every buyer found
+        twice. Deepening low-confidence buyers is its own step, and updates
+        them in place (CONTEXT.md).
+        """
+        if buyer_type is BuyerType.STRATEGIC:
+            self.strategic_buyers = list(candidates)
+        else:
+            self.sponsor_buyers = list(candidates)
+
     def summary_for_router(self) -> str:
         return (
             f"Target input: {self.target_input}\n"

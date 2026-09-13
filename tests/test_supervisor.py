@@ -12,15 +12,13 @@ from contextlib import ExitStack
 from typing import Any
 
 import pytest
-from pydantic_ai import ModelResponse, ToolCallPart, models
+from pydantic_ai import ModelResponse, ToolCallPart
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 import supervisor
-from deps import build_deps
-from schemas import BuyerType
-
-models.ALLOW_MODEL_REQUESTS = False
+from deps import Deps, build_deps
+from schemas import BuyerType, RunState
 
 RUN_ID = "run-test01"
 
@@ -31,19 +29,6 @@ RATIONALE = (
     "industrial gas customers, has bought two cryogenic component makers "
     "since 2021, and carries the balance-sheet capacity to pay cash."
 )
-
-
-def candidate(name: str, buyer_type: BuyerType) -> dict[str, Any]:
-    return {
-        "name": name,
-        "buyer_type": buyer_type.value,
-        "fit_score": 80,
-        "rationale": RATIONALE,
-        "signals": ["Acquired Cryo Components in 2023"],
-        "confidence": "high",
-        "sources": ["https://example.com/filing"],
-    }
-
 
 PROFILE = {
     "name": "Chart Industries",
@@ -62,35 +47,29 @@ PROFILE = {
 }
 
 
+def candidate(name: str, buyer_type: BuyerType) -> dict[str, Any]:
+    return {
+        "name": name,
+        "buyer_type": buyer_type.value,
+        "fit_score": 80,
+        "rationale": RATIONALE,
+        "signals": ["Acquired Cryo Components in 2023"],
+        "confidence": "high",
+        "sources": ["https://example.com/filing"],
+    }
+
+
 def batch(buyer_type: BuyerType, name: str = "Acme Corp") -> dict[str, Any]:
     return {"buyer_type": buyer_type.value, "candidates": [candidate(name, buyer_type)]}
 
 
-@pytest.fixture
-def deps():
-    return build_deps(RUN_ID)
-
-
-@pytest.mark.parametrize(
-    "buyer_type", [BuyerType.STRATEGIC, BuyerType.FINANCIAL_SPONSOR]
-)
-def test_specialist_agents_carry_the_research_tools(deps, buyer_type):
-    """Both specialists are built from the same path, so both reach the model
-    with every research tool attached — the gap this issue closes."""
-    seen: list[str] = []
-
-    def capture(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        seen.extend(sorted(tool.name for tool in info.function_tools))
-        return ModelResponse(
-            parts=[ToolCallPart(info.output_tools[0].name, batch(buyer_type))]
-        )
-
-    agent = supervisor.SPECIALIST_AGENTS[buyer_type]
-    with agent.override(model=FunctionModel(capture)):
-        result = agent.run_sync("Profile of the target", deps=deps)
-
-    assert seen == RESEARCH_TOOL_NAMES
-    assert result.output.buyer_type == buyer_type
+def the_other(buyer_type: BuyerType) -> BuyerType:
+    """The buyer type a specialist was *not* asked for."""
+    return (
+        BuyerType.FINANCIAL_SPONSOR
+        if buyer_type is BuyerType.STRATEGIC
+        else BuyerType.STRATEGIC
+    )
 
 
 class Responder:
@@ -112,47 +91,16 @@ class Responder:
         return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, payload)])
 
 
-def test_specialist_retries_a_batch_declared_as_the_wrong_buyer_type(deps):
-    """A sponsor batch from the strategic agent is not a result to store —
-    the model is sent back rather than letting it pollute the list."""
-    respond = Responder(
-        batch(BuyerType.FINANCIAL_SPONSOR), batch(BuyerType.STRATEGIC)
-    )
+class ToolCapturingResponder(Responder):
+    """A Responder that also records the tools the agent offered the model."""
 
-    with supervisor.strategic_agent.override(model=FunctionModel(respond)):
-        result = supervisor.strategic_agent.run_sync("Profile", deps=deps)
+    def __init__(self, *payloads: dict[str, Any]):
+        super().__init__(*payloads)
+        self.tool_names: list[str] = []
 
-    assert respond.calls == 2  # first answer rejected, second accepted
-    assert result.output.buyer_type == BuyerType.STRATEGIC
-
-
-def test_specialist_retries_an_empty_batch(deps):
-    """"No buyers" is never an acceptable answer from a sourcing agent."""
-    empty = {"buyer_type": BuyerType.STRATEGIC.value, "candidates": []}
-    respond = Responder(empty, batch(BuyerType.STRATEGIC))
-
-    with supervisor.strategic_agent.override(model=FunctionModel(respond)):
-        result = supervisor.strategic_agent.run_sync("Profile", deps=deps)
-
-    assert respond.calls == 2
-    assert len(result.output.candidates) == 1
-
-
-def test_profiler_carries_the_research_tools(deps):
-    """The profiler's instructions tell it to use tools; this is the wiring
-    that makes that true."""
-    seen: list[str] = []
-
-    def capture(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        seen.extend(sorted(tool.name for tool in info.function_tools))
-        return ModelResponse(
-            parts=[ToolCallPart(info.output_tools[0].name, PROFILE)]
-        )
-
-    with supervisor.profiler_agent.override(model=FunctionModel(capture)):
-        supervisor.profiler_agent.run_sync("Chart Industries", deps=deps)
-
-    assert seen == RESEARCH_TOOL_NAMES
+    def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        self.tool_names = sorted(tool.name for tool in info.function_tools)
+        return super().__call__(messages, info)
 
 
 def router(*steps: str) -> Responder:
@@ -165,7 +113,7 @@ def router(*steps: str) -> Responder:
     )
 
 
-def pipeline(router_steps: list[str], **agents: Any):
+def pipeline(router_steps: list[str], **agents: Any) -> RunState:
     """Override the router and each named agent, then run the pipeline."""
     overrides = {
         "router_agent": FunctionModel(router(*router_steps)),
@@ -177,7 +125,69 @@ def pipeline(router_steps: list[str], **agents: Any):
         return supervisor.run("Chart Industries — cryogenic equipment")
 
 
-def test_pipeline_populates_both_buyer_lists():
+@pytest.fixture
+def deps() -> Deps:
+    return build_deps(RUN_ID)
+
+
+@pytest.mark.parametrize("buyer_type", list(BuyerType))
+def test_specialist_agents_carry_the_research_tools(
+    deps: Deps, buyer_type: BuyerType
+) -> None:
+    """Both specialists are built from the same path, so both reach the model
+    with every research tool attached — the gap this issue closes."""
+    respond = ToolCapturingResponder(batch(buyer_type))
+    agent = supervisor.SPECIALIST_AGENTS[buyer_type]
+
+    with agent.override(model=FunctionModel(respond)):
+        result = agent.run_sync("Profile of the target", deps=deps)
+
+    assert respond.tool_names == RESEARCH_TOOL_NAMES
+    assert result.output.buyer_type == buyer_type
+
+
+def test_profiler_carries_the_research_tools(deps: Deps) -> None:
+    """The profiler's instructions tell it to use tools; this is the wiring
+    that makes that true."""
+    respond = ToolCapturingResponder(PROFILE)
+
+    with supervisor.profiler_agent.override(model=FunctionModel(respond)):
+        supervisor.profiler_agent.run_sync("Chart Industries", deps=deps)
+
+    assert respond.tool_names == RESEARCH_TOOL_NAMES
+
+
+@pytest.mark.parametrize("buyer_type", list(BuyerType))
+def test_specialist_retries_a_batch_declared_as_the_wrong_buyer_type(
+    deps: Deps, buyer_type: BuyerType
+) -> None:
+    """A batch sourced against the wrong brief is not a result to store —
+    the model is sent back rather than letting it pollute the list."""
+    respond = Responder(batch(the_other(buyer_type)), batch(buyer_type))
+    agent = supervisor.SPECIALIST_AGENTS[buyer_type]
+
+    with agent.override(model=FunctionModel(respond)):
+        result = agent.run_sync("Profile", deps=deps)
+
+    assert respond.calls == 2  # first answer rejected, second accepted
+    assert result.output.buyer_type == buyer_type
+
+
+@pytest.mark.parametrize("buyer_type", list(BuyerType))
+def test_specialist_retries_an_empty_batch(deps: Deps, buyer_type: BuyerType) -> None:
+    """"No buyers" is never an acceptable answer from a sourcing agent."""
+    empty = {"buyer_type": buyer_type.value, "candidates": []}
+    respond = Responder(empty, batch(buyer_type))
+    agent = supervisor.SPECIALIST_AGENTS[buyer_type]
+
+    with agent.override(model=FunctionModel(respond)):
+        result = agent.run_sync("Profile", deps=deps)
+
+    assert respond.calls == 2
+    assert len(result.output.candidates) == 1
+
+
+def test_pipeline_populates_both_buyer_lists() -> None:
     state = pipeline(
         ["profile_target", "find_strategic_buyers", "find_sponsor_buyers"],
         profiler_agent=Responder(PROFILE),
@@ -190,7 +200,9 @@ def test_pipeline_populates_both_buyer_lists():
     assert state.errors == []
 
 
-def test_dispatch_rejects_a_batch_of_the_wrong_buyer_type(monkeypatch):
+def test_dispatch_rejects_a_batch_of_the_wrong_buyer_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Defense in depth for a wiring mistake: if the agent invoked for
     strategic buyers hands back sponsors, they are recorded as an error
     rather than filed under strategic."""

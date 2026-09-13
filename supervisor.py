@@ -48,11 +48,10 @@ MODEL = "anthropic:claude-sonnet-4-6"  # pick per docs; cheap+fast is fine here
 # tool serves all three agents — docs/adr/0002-shared-deps-for-tool-resources.md.
 RESEARCH_TOOLS = [edgar_search, web_search, comps_lookup]
 
-# `defer_model_check=True` resolves MODEL at first run instead of at import.
-# Without it, importing this module raises UserError when ANTHROPIC_API_KEY is
-# unset, which would make the agents untestable — tests override the model and
-# never reach a provider at all.
-DEFER_MODEL_CHECK = True
+# Every agent below passes `defer_model_check=True`, which resolves MODEL at
+# first run instead of at import. Without it, importing this module raises
+# UserError when ANTHROPIC_API_KEY is unset, which would make the agents
+# untestable — tests override the model and never reach a provider at all.
 
 # ---------------------------------------------------------------------------
 # Agents. Each declares its output schema; Pydantic AI validates the model's
@@ -77,7 +76,7 @@ router_agent = Agent(
         "- Everything complete -> done."
     ),
     retries=2,  # validation-failure retries
-    defer_model_check=DEFER_MODEL_CHECK,
+    defer_model_check=True,
 )
 
 profiler_agent = Agent(
@@ -91,7 +90,7 @@ profiler_agent = Agent(
     ),
     tools=RESEARCH_TOOLS,
     retries=2,
-    defer_model_check=DEFER_MODEL_CHECK,
+    defer_model_check=True,
 )
 
 synthesis_agent = Agent(
@@ -103,7 +102,7 @@ synthesis_agent = Agent(
         "Do not invent buyers not present in the inputs."
     ),
     retries=2,
-    defer_model_check=DEFER_MODEL_CHECK,
+    defer_model_check=True,
 )
 
 STRATEGIC_INSTRUCTIONS = (
@@ -150,7 +149,7 @@ def build_specialist_agent(
         instructions=instructions,
         tools=RESEARCH_TOOLS,
         retries=2,
-        defer_model_check=DEFER_MODEL_CHECK,
+        defer_model_check=True,
     )
 
     @agent.output_validator
@@ -221,14 +220,7 @@ async def _source_buyers(state: RunState, deps: Deps, buyer_type: BuyerType) -> 
             f"specialist for {buyer_type.value} returned a {batch.buyer_type.value} batch"
         )
 
-    # Replace rather than extend: a re-run of this step re-sources the list
-    # from scratch, and appending would duplicate every buyer found twice.
-    # (Deepening low-confidence buyers is its own step — see CONTEXT.md.)
-    if buyer_type is BuyerType.STRATEGIC:
-        state.strategic_buyers = list(batch.candidates)
-    else:
-        state.sponsor_buyers = list(batch.candidates)
-
+    state.record_buyers(buyer_type, batch.candidates)
     log.info(
         "sourced %d %s buyers: run_id=%s",
         len(batch.candidates), buyer_type.value, state.run_id,
