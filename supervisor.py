@@ -18,6 +18,7 @@ from pydantic import TypeAdapter
 from pydantic_ai import Agent, ModelRetry, RunContext
 
 from deps import Deps, build_deps
+from llm import build_model, run_agent
 from schemas import (
     BuyerCandidate,
     BuyerCandidateBatch,
@@ -44,7 +45,7 @@ log = logging.getLogger("supervisor")
 MAX_ITERATIONS = 12       # hard cap: the loop can never run away
 MAX_DEEPEN_ROUNDS = 2     # low-confidence re-research is bounded
 
-MODEL = "anthropic:claude-sonnet-4-6"  # pick per docs; cheap+fast is fine here
+MODEL = build_model()  # model choice and its retry/timeout policy live in llm.py
 
 # Every research agent gets the same three tools: the specialists and the
 # profiler ask the same kinds of question (who filed what, what was reported,
@@ -52,11 +53,6 @@ MODEL = "anthropic:claude-sonnet-4-6"  # pick per docs; cheap+fast is fine here
 # Plain functions attached here rather than `@agent.tool` decorators, so one
 # tool serves all three agents — docs/adr/0002-shared-deps-for-tool-resources.md.
 RESEARCH_TOOLS = [edgar_search, web_search, comps_lookup]
-
-# Every agent below passes `defer_model_check=True`, which resolves MODEL at
-# first run instead of at import. Without it, importing this module raises
-# UserError when ANTHROPIC_API_KEY is unset, which would make the agents
-# untestable — tests override the model and never reach a provider at all.
 
 # ---------------------------------------------------------------------------
 # Agents. Each declares its output schema; Pydantic AI validates the model's
@@ -67,6 +63,7 @@ RESEARCH_TOOLS = [edgar_search, web_search, comps_lookup]
 
 router_agent = Agent(
     MODEL,
+    name="router",
     output_type=RouterDecision,
     instructions=(
         "You are the supervisor of a buyer-landscape analysis pipeline for an "
@@ -81,11 +78,11 @@ router_agent = Agent(
         "- Everything complete -> done."
     ),
     retries=2,  # validation-failure retries
-    defer_model_check=True,
 )
 
 profiler_agent = Agent(
     MODEL,
+    name="profiler",
     deps_type=Deps,
     output_type=TargetProfile,
     instructions=(
@@ -95,11 +92,11 @@ profiler_agent = Agent(
     ),
     tools=RESEARCH_TOOLS,
     retries=2,
-    defer_model_check=True,
 )
 
 synthesis_agent = Agent(
     MODEL,
+    name="synthesis",
     output_type=BuyerLandscape,
     instructions=(
         "Assemble the final buyer landscape from the profile and candidate "
@@ -107,7 +104,6 @@ synthesis_agent = Agent(
         "Do not invent buyers not present in the inputs."
     ),
     retries=2,
-    defer_model_check=True,
 )
 
 STRATEGIC_INSTRUCTIONS = (
@@ -138,7 +134,7 @@ SPONSOR_INSTRUCTIONS = (
 
 
 def build_buyer_agent[OutputT](
-    output_type: type[OutputT], instructions: str
+    output_type: type[OutputT], instructions: str, name: str
 ) -> Agent[Deps, OutputT]:
     """The wiring every buyer-facing agent shares.
 
@@ -150,12 +146,12 @@ def build_buyer_agent[OutputT](
     """
     return Agent(
         MODEL,
+        name=name,
         deps_type=Deps,
         output_type=output_type,
         instructions=instructions,
         tools=RESEARCH_TOOLS,
         retries=2,
-        defer_model_check=True,
     )
 
 
@@ -163,7 +159,9 @@ def build_specialist_agent(
     buyer_type: BuyerType, instructions: str
 ) -> Agent[Deps, BuyerCandidateBatch]:
     """Build one buyer-sourcing specialist, held to the type it was asked for."""
-    agent = build_buyer_agent(BuyerCandidateBatch, instructions)
+    agent = build_buyer_agent(
+        BuyerCandidateBatch, instructions, name=f"{buyer_type.value}_specialist"
+    )
 
     @agent.output_validator
     def check_batch_matches_agent(
@@ -223,7 +221,9 @@ def build_deepen_agent(buyer_type: BuyerType) -> Agent[Deps, DeepenedBatch]:
     buyers it was handed. One agent per buyer type so the output validator can
     hold the findings to the list they were run against.
     """
-    agent = build_buyer_agent(DeepenedBatch, DEEPEN_INSTRUCTIONS)
+    agent = build_buyer_agent(
+        DeepenedBatch, DEEPEN_INSTRUCTIONS, name=f"{buyer_type.value}_deepen"
+    )
 
     @agent.output_validator
     def check_findings_match_agent(
@@ -279,8 +279,9 @@ async def _source_buyers(state: RunState, deps: Deps, buyer_type: BuyerType) -> 
         raise RuntimeError("no profile yet; profile the target before sourcing buyers")
 
     agent = SPECIALIST_AGENTS[buyer_type]
-    result = await agent.run(_specialist_prompt(state.profile), deps=deps)
-    batch = result.output
+    batch = await run_agent(
+        agent, _specialist_prompt(state.profile), run_id=state.run_id, deps=deps
+    )
 
     # The agent's own output validator already checks this, so reaching here
     # means the dispatch table is wired to the wrong agent — a bug in this
@@ -323,8 +324,9 @@ async def _deepen_one_list(
     """Re-research one list's low-confidence candidates and fold the result in."""
     targets = state.low_confidence_buyers(buyer_type)
     agent = DEEPEN_AGENTS[buyer_type]
-    result = await agent.run(_deepen_prompt(profile, targets), deps=deps)
-    batch = result.output
+    batch = await run_agent(
+        agent, _deepen_prompt(profile, targets), run_id=state.run_id, deps=deps
+    )
 
     # As in `_source_buyers`: the agent's validator already checked this, so
     # reaching here means DEEPEN_AGENTS is miswired.
@@ -423,7 +425,9 @@ async def dispatch(state: RunState, deps: Deps, step: NextStep) -> None:
     owns `DONE` too, since finishing is a loop decision rather than a step.
     """
     if step == NextStep.PROFILE_TARGET:
-        state.profile = (await profiler_agent.run(state.target_input, deps=deps)).output
+        state.profile = await run_agent(
+            profiler_agent, state.target_input, run_id=state.run_id, deps=deps
+        )
 
     elif step == NextStep.FIND_STRATEGIC_BUYERS:
         await _source_buyers(state, deps, BuyerType.STRATEGIC)
@@ -440,7 +444,7 @@ async def dispatch(state: RunState, deps: Deps, step: NextStep) -> None:
             f"STRATEGIC:\n{[b.model_dump() for b in state.strategic_buyers]}\n\n"
             f"SPONSORS:\n{[b.model_dump() for b in state.sponsor_buyers]}"
         )
-        state.landscape = (await synthesis_agent.run(prompt)).output
+        state.landscape = await run_agent(synthesis_agent, prompt, run_id=state.run_id)
 
     elif step == NextStep.WRITE_TO_CRM:
         await _write_landscape_to_crm(state, deps)
@@ -453,7 +457,19 @@ async def _run(target_input: str) -> RunState:
 
     try:
         for iteration in range(MAX_ITERATIONS):
-            decision = (await router_agent.run(state.summary_for_router(MAX_DEEPEN_ROUNDS))).output
+            try:
+                decision = await run_agent(
+                    router_agent,
+                    state.summary_for_router(MAX_DEEPEN_ROUNDS),
+                    run_id=state.run_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — degrade, don't crash
+                # `run_agent` has already spent the retry budget, and with no
+                # router there is no next step to take: finish degraded with
+                # the failure on record rather than raising out of the run.
+                log.exception("routing failed (run_id=%s)", state.run_id)
+                state.errors.append(f"route: {exc}")
+                break
             log.info(
                 "routing: iter=%d step=%s reason=%r run_id=%s",
                 iteration, decision.next_step.value, decision.reason, state.run_id,

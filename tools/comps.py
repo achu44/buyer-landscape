@@ -20,7 +20,7 @@ from typing import Annotated, Any
 from pydantic import Field, ValidationError
 from pydantic_ai import RunContext
 from pydantic_ai.exceptions import ModelRetry, ToolFailed
-from tenacity import AsyncRetrying, retry_if_exception
+from tenacity import AsyncRetrying
 import yfinance as yf
 # yfinance re-exports whichever HTTP backend it loaded (curl_cffi, or requests
 # as a fallback), so its exception classes are the ones that actually reach us.
@@ -95,8 +95,7 @@ async def _fetch_info_with_retry(ticker: str, run_id: str) -> dict[str, Any]:
     raises its own backend's exceptions rather than httpx's. The timeout
     stops the wait, not the worker thread, which yfinance gives no way to
     cancel."""
-    policy: dict[str, Any] = {**retry_kwargs(run_id, log), "retry": retry_if_exception(_is_transient)}
-    async for attempt in AsyncRetrying(**policy):
+    async for attempt in AsyncRetrying(**retry_kwargs(run_id, log, is_transient=_is_transient)):
         with attempt:
             return await asyncio.wait_for(
                 asyncio.to_thread(_fetch_info, ticker), timeout=FETCH_TIMEOUT_SECONDS

@@ -16,10 +16,13 @@ from typing import Any
 
 import pytest
 from pydantic_ai import ModelResponse, ToolCallPart
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+import deps as deps_module
 import supervisor
+from tests.fakes import MODEL_NAME, ProviderDown
 from deps import Deps, build_deps
 from schemas import BuyerLandscape, BuyerType, NextStep, RunState
 
@@ -626,3 +629,50 @@ def test_write_to_crm_without_a_landscape_fails_and_writes_nothing(
 
     assert state.crm_written is False
     assert not crm_db.exists()
+
+
+# ---------------------------------------------------------------------------
+# External-call policy: provider failures are retried, then degrade
+# ---------------------------------------------------------------------------
+
+@pytest.mark.usefixtures("no_backoff")
+def test_a_step_whose_provider_stays_down_degrades_into_run_errors() -> None:
+    """The profiler's provider is overloaded for every attempt: the provider
+    call is re-attempted up to the budget, then the step's failure is recorded
+    for the router — not a crash."""
+    profiler = ProviderDown(529)
+
+    state = pipeline(["profile_target"], profiler_agent=profiler)
+
+    assert profiler.calls == deps_module.MAX_ATTEMPTS
+    assert state.profile is None
+    assert any(e.startswith("profile_target:") and "529" in e for e in state.errors)
+
+
+@pytest.mark.usefixtures("no_backoff")
+def test_a_router_whose_provider_stays_down_ends_the_run_degraded() -> None:
+    """With no router there is no next step to take; the run finishes with the
+    failure recorded rather than raising out of `supervisor.run`."""
+    router_model = ProviderDown(503)
+
+    with supervisor.router_agent.override(model=FunctionModel(router_model)):
+        state = supervisor.run("Chart Industries — cryogenic equipment")
+
+    assert router_model.calls == deps_module.MAX_ATTEMPTS
+    assert state.steps_taken == []
+    assert any(e.startswith("route:") and "503" in e for e in state.errors)
+
+
+@pytest.mark.usefixtures("no_backoff")
+def test_a_transient_provider_blip_does_not_fail_the_step() -> None:
+    class BlipThenProfile(Responder):
+        def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+            if self.calls == 0:
+                self.calls += 1
+                raise ModelHTTPError(status_code=529, model_name=MODEL_NAME)
+            return super().__call__(messages, info)
+
+    state = pipeline(["profile_target"], profiler_agent=BlipThenProfile(PROFILE))
+
+    assert state.profile is not None
+    assert state.errors == []
