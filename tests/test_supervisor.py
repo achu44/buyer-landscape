@@ -10,9 +10,12 @@ instructions.
 
 import asyncio
 from contextlib import ExitStack
+from functools import partial
+import logging
 from pathlib import Path
 import sqlite3
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from pydantic_ai import ModelResponse, ToolCallPart
@@ -167,15 +170,35 @@ def router(*steps: str) -> Responder:
     )
 
 
-def pipeline(router_steps: list[str], **agents: Any) -> RunState:
-    """Override the router and each named agent, then run the pipeline."""
+def pipeline(
+    router_steps: list[str], crm_db: Path | None = None, **agents: Any
+) -> RunState:
+    """Run the pipeline with a router that walks `router_steps`, then stops."""
+    return pipeline_with_router(router(*router_steps), crm_db, **agents)
+
+
+def pipeline_with_router(
+    router_model: Responder, crm_db: Path | None = None, **agents: Any
+) -> RunState:
+    """Override the router and each named agent, then run the pipeline.
+
+    Takes any router model, not just a list of steps, so a test can hand it a
+    router that never says done. `crm_db` points the run's CRM writes at a
+    test database; `run()` builds its own `Deps`, so that is the seam.
+    """
     overrides = {
-        "router_agent": FunctionModel(router(*router_steps)),
+        "router_agent": FunctionModel(router_model),
         **{name: FunctionModel(model) for name, model in agents.items()},
     }
     with ExitStack() as stack:
         for name, model in overrides.items():
             stack.enter_context(getattr(supervisor, name).override(model=model))
+        if crm_db is not None:
+            stack.enter_context(
+                patch.object(
+                    supervisor, "build_deps", partial(build_deps, crm_db_path=str(crm_db))
+                )
+            )
         return supervisor.run("Chart Industries — cryogenic equipment")
 
 
@@ -537,22 +560,25 @@ SUMMARY = (
 )
 
 
+def landscape_payload() -> dict[str, Any]:
+    """A five-buyer landscape as the synthesis model would hand it back."""
+    return {
+        "target": PROFILE,
+        "strategic_buyers": [
+            candidate("Air Liquide", BuyerType.STRATEGIC),
+            candidate("Linde", BuyerType.STRATEGIC),
+            candidate("Air Products", BuyerType.STRATEGIC, "medium"),
+        ],
+        "sponsor_buyers": [
+            candidate("Apollo", BuyerType.FINANCIAL_SPONSOR),
+            candidate("KKR", BuyerType.FINANCIAL_SPONSOR, "low"),
+        ],
+        "summary": SUMMARY,
+    }
+
+
 def landscape_with_five_buyers() -> BuyerLandscape:
-    return BuyerLandscape.model_validate(
-        {
-            "target": PROFILE,
-            "strategic_buyers": [
-                candidate("Air Liquide", BuyerType.STRATEGIC),
-                candidate("Linde", BuyerType.STRATEGIC),
-                candidate("Air Products", BuyerType.STRATEGIC, "medium"),
-            ],
-            "sponsor_buyers": [
-                candidate("Apollo", BuyerType.FINANCIAL_SPONSOR),
-                candidate("KKR", BuyerType.FINANCIAL_SPONSOR, "low"),
-            ],
-            "summary": SUMMARY,
-        }
-    )
+    return BuyerLandscape.model_validate(landscape_payload())
 
 
 @pytest.fixture
@@ -676,3 +702,176 @@ def test_a_transient_provider_blip_does_not_fail_the_step() -> None:
 
     assert state.profile is not None
     assert state.errors == []
+
+
+# ---------------------------------------------------------------------------
+# End to end: the whole pipeline together, and its guardrails under pressure
+# ---------------------------------------------------------------------------
+
+def test_a_full_run_profiles_sources_deepens_synthesizes_and_writes_the_crm(
+    crm_db: Path,
+) -> None:
+    """Every step in order, each one working from what the last left behind:
+    deepening resolves the strategic list's shaky names before synthesis sees
+    it, and the synthesized landscape is what lands in the CRM."""
+    strategic_deepen = Responder(
+        deepened(
+            BuyerType.STRATEGIC,
+            confirms("Air Products", BuyerType.STRATEGIC),
+            refutes("Ghost Industrial"),
+        )
+    )
+    sponsor_deepen = Responder(
+        deepened(BuyerType.FINANCIAL_SPONSOR, confirms("Apollo", BuyerType.FINANCIAL_SPONSOR))
+    )
+    synthesis = PromptCapturingResponder(landscape_payload())
+    steps = [
+        "profile_target",
+        "find_strategic_buyers",
+        "find_sponsor_buyers",
+        "deepen_research",
+        "synthesize",
+        "write_to_crm",
+    ]
+
+    state = pipeline(
+        steps,
+        crm_db,
+        profiler_agent=Responder(PROFILE),
+        strategic_agent=Responder(
+            batch_of(
+                BuyerType.STRATEGIC,
+                candidate("Air Liquide", BuyerType.STRATEGIC),
+                candidate("Linde", BuyerType.STRATEGIC),
+                candidate("Air Products", BuyerType.STRATEGIC, "low"),
+                candidate("Ghost Industrial", BuyerType.STRATEGIC, "low"),
+            )
+        ),
+        sponsor_agent=Responder(
+            batch_of(
+                BuyerType.FINANCIAL_SPONSOR,
+                candidate("Apollo", BuyerType.FINANCIAL_SPONSOR),
+                candidate("KKR", BuyerType.FINANCIAL_SPONSOR),
+            )
+        ),
+        strategic_deepen_agent=strategic_deepen,
+        sponsor_deepen_agent=sponsor_deepen,
+        synthesis_agent=synthesis,
+    )
+
+    assert state.errors == []
+    assert state.steps_taken == steps + ["done"]
+
+    # Deepening ran where it was triggered, and only there.
+    assert strategic_deepen.calls == 1
+    assert sponsor_deepen.calls == 0
+    assert state.deepen_rounds_used == 1
+    assert [b.name for b in state.strategic_buyers] == ["Air Liquide", "Linde", "Air Products"]
+
+    # Synthesis worked from the deepened lists, not the sourced ones.
+    assert "Air Products" in synthesis.prompts[0]
+    assert "Ghost Industrial" not in synthesis.prompts[0]
+
+    assert state.landscape is not None
+    assert state.crm_written is True
+    assert crm_rows(crm_db, "SELECT name, run_id FROM accounts") == [
+        ("Chart Industries", state.run_id)
+    ]
+    # One Opportunity per buyer in the synthesized landscape.
+    assert sorted(crm_rows(crm_db, "SELECT buyer_name FROM opportunities")) == sorted(
+        (b.name,) for b in state.landscape.strategic_buyers + state.landscape.sponsor_buyers
+    )
+
+
+def test_the_iteration_cap_stops_a_router_that_never_says_done(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every step succeeds and the router still never finishes. Nothing fails
+    here, so the only thing that can end the run is the cap."""
+    runaway = Responder(
+        {"next_step": "profile_target", "reason": "The profile could always be better."}
+    )
+
+    with caplog.at_level(logging.WARNING, logger="supervisor"):
+        state = pipeline_with_router(runaway, profiler_agent=Responder(PROFILE))
+
+    assert runaway.calls == supervisor.MAX_ITERATIONS
+    assert state.steps_taken == ["profile_target"] * supervisor.MAX_ITERATIONS
+    assert state.errors == []
+    assert "hit MAX_ITERATIONS without DONE" in caplog.text
+
+
+def test_a_step_that_raises_is_recorded_and_the_run_goes_on(
+    crm_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CRM is locked on the first write. The failure lands in run state's
+    errors, the router gets another turn, and its second try goes through —
+    the run neither crashes nor finishes having skipped the write."""
+    write_for_real = supervisor.write_to_crm
+    writes = 0
+
+    def locked_on_first_write(*args: Any) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise sqlite3.OperationalError("database is locked")
+        write_for_real(*args)
+
+    monkeypatch.setattr(supervisor, "write_to_crm", locked_on_first_write)
+
+    state = pipeline(
+        [
+            "profile_target",
+            "find_strategic_buyers",
+            "find_sponsor_buyers",
+            "synthesize",
+            "write_to_crm",
+            "write_to_crm",
+        ],
+        crm_db,
+        profiler_agent=Responder(PROFILE),
+        strategic_agent=Responder(batch(BuyerType.STRATEGIC, "Air Liquide")),
+        sponsor_agent=Responder(batch(BuyerType.FINANCIAL_SPONSOR, "Apollo")),
+        synthesis_agent=Responder(landscape_payload()),
+    )
+
+    assert state.errors == ["write_to_crm: database is locked"]
+    assert state.steps_taken[-3:] == ["write_to_crm", "write_to_crm", "done"]
+    assert state.crm_written is True
+    assert crm_rows(crm_db, "SELECT COUNT(*) FROM accounts") == [(1,)]
+
+
+def test_the_deepen_round_cap_holds_across_a_full_run(crm_db: Path) -> None:
+    """A router that re-sources between rounds hands every deepen request a
+    fresh list of shaky names. The cap counts rounds over the run, so fresh
+    names do not buy fresh rounds — and once it is spent, the run still
+    synthesizes and writes rather than stalling on the names left unresolved."""
+    deepen = Responder(
+        deepened(BuyerType.STRATEGIC, confirms("Air Liquide", BuyerType.STRATEGIC, "low"))
+    )
+
+    # Re-source and deepen one round past the cap, then finish the run.
+    steps = (
+        ["profile_target", "find_sponsor_buyers"]
+        + ["find_strategic_buyers", "deepen_research"] * (supervisor.MAX_DEEPEN_ROUNDS + 1)
+        + ["synthesize", "write_to_crm"]
+    )
+
+    state = pipeline(
+        steps,
+        crm_db,
+        profiler_agent=Responder(PROFILE),
+        strategic_agent=Responder(
+            batch_of(BuyerType.STRATEGIC, candidate("Air Liquide", BuyerType.STRATEGIC, "low"))
+        ),
+        sponsor_agent=Responder(batch(BuyerType.FINANCIAL_SPONSOR, "Apollo")),
+        strategic_deepen_agent=deepen,
+        synthesis_agent=Responder(landscape_payload()),
+    )
+
+    assert deepen.calls == supervisor.MAX_DEEPEN_ROUNDS
+    assert state.deepen_rounds_used == supervisor.MAX_DEEPEN_ROUNDS
+    assert len(state.errors) == 1
+    assert "past the round cap" in state.errors[0]
+    assert state.low_confidence_count() == 1
+    assert state.crm_written is True
