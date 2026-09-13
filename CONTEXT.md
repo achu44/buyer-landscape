@@ -20,7 +20,10 @@ Free text attached to an `Opportunity`, holding that buyer's `rationale` and
 `signals`. The overall banker-readable summary is a `Note` on the `Account`.
 
 **Deepen-research round**:
-A bounded re-run of a specialist agent against only its current low-confidence
-`BuyerCandidate`s, asking it to confirm or refute each with new evidence. The
-agent's returned candidates replace the corresponding low-confidence entries
-in place — deepening never appends duplicates.
+One bounded pass over *every* buyer list that currently holds low-confidence
+`BuyerCandidate`s, asking a deepen agent to confirm or refute each of them
+against fresh evidence. A confirmed candidate replaces its low-confidence
+entry in place — deepening never appends duplicates. A refuted candidate, or
+one the pass never reported on, is dropped. The cap counts rounds, not agent
+runs: a round covers both lists.
+_Avoid_: "retry" (that's a failed step run again, not a shaky answer firmed up)

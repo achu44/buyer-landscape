@@ -40,6 +40,17 @@ class NextStep(str, Enum):
     DONE = "done"
 
 
+def name_key(name: str) -> str:
+    """How two buyer names are matched.
+
+    Buyer names travel between agents as free text, and the same buyer comes
+    back spaced or cased differently often enough that matching on the raw
+    string would duplicate a candidate here and fail to replace one there.
+    One spelling of the rule so every match in this file agrees.
+    """
+    return name.strip().lower()
+
+
 # ---------------------------------------------------------------------------
 # Agent outputs
 # ---------------------------------------------------------------------------
@@ -97,10 +108,95 @@ class BuyerCandidateBatch(BaseModel):
                 )
         seen: set[str] = set()
         for c in self.candidates:
-            key = c.name.lower()
+            key = name_key(c.name)
             if key in seen:
                 raise ValueError(f"duplicate candidate name in batch: {c.name}")
             seen.add(key)
+        return self
+
+
+class DeepenVerdict(str, Enum):
+    """What a deepen-research pass concluded about one low-confidence buyer.
+
+    Deliberately binary: the round exists to decide whether a name stays in
+    the landscape, and "maybe" would leave the same unsubstantiated buyer the
+    round was called to resolve.
+    """
+
+    CONFIRMED = "confirmed"
+    REFUTED = "refuted"
+
+
+class DeepenedCandidate(BaseModel):
+    """One low-confidence buyer, re-researched.
+
+    The verdict is stated rather than inferred from what came back, so a
+    candidate the pass could not substantiate is distinguishable from one it
+    simply forgot to report on.
+    """
+
+    original_name: str = Field(
+        min_length=1,
+        description="The low-confidence candidate this finding is about, named exactly as it was given",
+    )
+    verdict: DeepenVerdict
+    evidence: str = Field(
+        min_length=80,
+        description="What the pass found: the confirming evidence, or why the name could not be substantiated",
+    )
+    confirmed_candidate: BuyerCandidate | None = Field(
+        default=None,
+        description="The re-researched buyer, carrying the new evidence. Required when confirmed; omit when refuted",
+    )
+
+    @model_validator(mode="after")
+    def check_verdict_matches_candidate(self) -> "DeepenedCandidate":
+        if self.verdict is DeepenVerdict.REFUTED:
+            if self.confirmed_candidate is not None:
+                raise ValueError(
+                    f"{self.original_name} is refuted but carries a candidate; a refuted buyer is dropped"
+                )
+            return self
+        if self.confirmed_candidate is None:
+            raise ValueError(
+                f"{self.original_name} is confirmed but carries no candidate; return the re-researched buyer"
+            )
+        # The name is what the merge matches on, so a confirmation that renames
+        # the buyer would have nothing to replace and would read as a new one.
+        if name_key(self.confirmed_candidate.name) != name_key(self.original_name):
+            raise ValueError(
+                f"confirmed candidate is named {self.confirmed_candidate.name!r} but re-researched "
+                f"{self.original_name!r}; keep the original name"
+            )
+        return self
+
+
+class DeepenedBatch(BaseModel):
+    """Output of a deepen-research pass over one buyer list.
+
+    Unlike `BuyerCandidateBatch`, this may confirm nothing at all — a round
+    that refutes every name it was given is a real and useful answer — but it
+    must say something about at least one candidate, since it is only ever run
+    when there are low-confidence buyers to resolve.
+    """
+
+    buyer_type: BuyerType
+    findings: list[DeepenedCandidate] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def check_types_and_uniqueness(self) -> "DeepenedBatch":
+        seen: set[str] = set()
+        for f in self.findings:
+            key = name_key(f.original_name)
+            if key in seen:
+                raise ValueError(f"two findings for the same candidate: {f.original_name}")
+            seen.add(key)
+            buyer = f.confirmed_candidate
+            if buyer is not None and buyer.buyer_type != self.buyer_type:
+                raise ValueError(
+                    f"{buyer.name} is typed {buyer.buyer_type.value} but batch is "
+                    f"declared {self.buyer_type.value}"
+                )
         return self
 
 
@@ -328,22 +424,75 @@ class RunState(BaseModel):
         twice. Deepening low-confidence buyers is its own step, and updates
         them in place (CONTEXT.md).
         """
-        if buyer_type is BuyerType.STRATEGIC:
-            self.strategic_buyers = list(candidates)
-        else:
-            self.sponsor_buyers = list(candidates)
+        self.buyers_for(buyer_type)[:] = candidates
 
-    def summary_for_router(self) -> str:
+    def apply_deepening(
+        self, buyer_type: BuyerType, findings: list[DeepenedCandidate]
+    ) -> None:
+        """Fold a deepen-research pass back into one buyer list, in place.
+
+        A confirmed candidate replaces the low-confidence entry it
+        re-researched; a refuted one is dropped, and so is a low-confidence
+        entry the pass never reported on — silence is not substantiation, and
+        the point of the round is that no unevidenced name survives it
+        (CONTEXT.md). Entries that were never low-confidence are untouched,
+        and order is preserved so the list still reads as it was sourced.
+        """
+        confirmed = {
+            name_key(f.original_name): f.confirmed_candidate
+            for f in findings
+            if f.verdict is DeepenVerdict.CONFIRMED and f.confirmed_candidate is not None
+        }
+        kept: list[BuyerCandidate] = []
+        for existing in self.buyers_for(buyer_type):
+            if existing.confidence is not Confidence.LOW:
+                kept.append(existing)
+                continue
+            replacement = confirmed.get(name_key(existing.name))
+            if replacement is not None:
+                # Names match case- and space-insensitively, so a pass that
+                # re-types one would otherwise rename the buyer in the
+                # landscape. Keep the spelling it was sourced under.
+                kept.append(replacement.model_copy(update={"name": existing.name}))
+        self.record_buyers(buyer_type, kept)
+
+    def buyers_for(self, buyer_type: BuyerType) -> list[BuyerCandidate]:
+        """The buyer list for one type — the read side of `record_buyers`."""
+        if buyer_type is BuyerType.STRATEGIC:
+            return self.strategic_buyers
+        return self.sponsor_buyers
+
+    def low_confidence_buyers(self, buyer_type: BuyerType) -> list[BuyerCandidate]:
+        """The candidates in one list that a deepen-research round would target."""
+        return [b for b in self.buyers_for(buyer_type) if b.confidence is Confidence.LOW]
+
+    def low_confidence_count(self) -> int:
+        """Low-confidence candidates across both lists.
+
+        The router decides whether to deepen from this one number: a run with
+        one shaky name in each list needs a round as much as one with two in
+        the same list, and per-list counts alone hide that.
+        """
+        return sum(len(self.low_confidence_buyers(bt)) for bt in BuyerType)
+
+    def summary_for_router(self, deepen_round_cap: int) -> str:
+        """Render the state for the router prompt.
+
+        The cap is passed in rather than read from here: the supervisor owns
+        the guardrail, and taking it as an argument means the number quoted to
+        the router cannot drift from the one the loop enforces.
+        """
         return (
             f"Target input: {self.target_input}\n"
             f"Profile built: {self.profile is not None}\n"
             f"Strategic buyers found: {len(self.strategic_buyers)} "
-            f"(low-confidence: {sum(1 for b in self.strategic_buyers if b.confidence == Confidence.LOW)})\n"
+            f"(low-confidence: {len(self.low_confidence_buyers(BuyerType.STRATEGIC))})\n"
             f"Sponsor buyers found: {len(self.sponsor_buyers)} "
-            f"(low-confidence: {sum(1 for b in self.sponsor_buyers if b.confidence == Confidence.LOW)})\n"
+            f"(low-confidence: {len(self.low_confidence_buyers(BuyerType.FINANCIAL_SPONSOR))})\n"
+            f"Low-confidence buyers across both lists: {self.low_confidence_count()}\n"
             f"Landscape synthesized: {self.landscape is not None}\n"
             f"CRM written: {self.crm_written}\n"
-            f"Deepen-research rounds used: {self.deepen_rounds_used} of 2\n"
+            f"Deepen-research rounds used: {self.deepen_rounds_used} of {deepen_round_cap}\n"
             f"Steps so far: {', '.join(self.steps_taken) or 'none'}\n"
             f"Errors so far: {'; '.join(self.errors) or 'none'}"
         )

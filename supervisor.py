@@ -14,17 +14,21 @@ import asyncio
 import logging
 import uuid
 
+from pydantic import TypeAdapter
 from pydantic_ai import Agent, ModelRetry, RunContext
 
 from deps import Deps, build_deps
 from schemas import (
+    BuyerCandidate,
     BuyerCandidateBatch,
     BuyerLandscape,
     BuyerType,
+    DeepenedBatch,
     NextStep,
     RouterDecision,
     RunState,
     TargetProfile,
+    name_key,
 )
 from tools.comps import comps_lookup
 from tools.edgar import edgar_search
@@ -132,25 +136,33 @@ SPONSOR_INSTRUCTIONS = (
 )
 
 
-def build_specialist_agent(
-    buyer_type: BuyerType, instructions: str
-) -> Agent[Deps, BuyerCandidateBatch]:
-    """Build one buyer-sourcing specialist.
+def build_buyer_agent[OutputT](
+    output_type: type[OutputT], instructions: str
+) -> Agent[Deps, OutputT]:
+    """The wiring every buyer-facing agent shares.
 
-    Strategic and sponsor sourcing differ in what the model is told to look
-    for and in the buyer type it must come back with — never in wiring. One
-    construction path so a tool added here reaches both, rather than two
-    near-copies that drift apart.
+    Sourcing strategic buyers, sourcing sponsors and re-researching either
+    list differ in what the model is told to look for and in what it must
+    hand back — never in wiring. One construction path so a tool or a retry
+    setting added here reaches all four, rather than near-copies that drift
+    apart.
     """
-    agent = Agent(
+    return Agent(
         MODEL,
         deps_type=Deps,
-        output_type=BuyerCandidateBatch,
+        output_type=output_type,
         instructions=instructions,
         tools=RESEARCH_TOOLS,
         retries=2,
         defer_model_check=True,
     )
+
+
+def build_specialist_agent(
+    buyer_type: BuyerType, instructions: str
+) -> Agent[Deps, BuyerCandidateBatch]:
+    """Build one buyer-sourcing specialist, held to the type it was asked for."""
+    agent = build_buyer_agent(BuyerCandidateBatch, instructions)
 
     @agent.output_validator
     def check_batch_matches_agent(
@@ -181,6 +193,64 @@ sponsor_agent = build_specialist_agent(BuyerType.FINANCIAL_SPONSOR, SPONSOR_INST
 SPECIALIST_AGENTS: dict[BuyerType, Agent[Deps, BuyerCandidateBatch]] = {
     BuyerType.STRATEGIC: strategic_agent,
     BuyerType.FINANCIAL_SPONSOR: sponsor_agent,
+}
+
+DEEPEN_INSTRUCTIONS = (
+    "You re-research buyer candidates that were sourced with LOW confidence, "
+    "and decide which of them belong in the landscape at all.\n"
+    "Work only from what you can find now. Use your tools: EDGAR full-text "
+    "search for what the buyer has filed and bought, web search for announced "
+    "deals and stated strategy, comps lookup for whether it can pay.\n"
+    "Confirm a candidate only when you found new, citable evidence for it — "
+    "then hand back the buyer rewritten around that evidence, with the new "
+    "signals and sources, a fit_score that reflects them, and the confidence "
+    "the evidence actually supports. Refute it when the evidence is absent, "
+    "thin, or contradicts the original rationale: a refuted buyer is dropped "
+    "from the landscape, which is the right outcome for a name nobody can "
+    "substantiate.\n"
+    "Report on every candidate you are given, keep each name exactly as it "
+    "was given to you, and introduce no new buyers — sourcing is someone "
+    "else's step."
+)
+
+
+def build_deepen_agent(buyer_type: BuyerType) -> Agent[Deps, DeepenedBatch]:
+    """Build the deepen-research pass for one buyer list.
+
+    Separate from `build_specialist_agent` because the two ask the model for
+    different things: a specialist returns buyers, this returns verdicts on
+    buyers it was handed. One agent per buyer type so the output validator can
+    hold the findings to the list they were run against.
+    """
+    agent = build_buyer_agent(DeepenedBatch, DEEPEN_INSTRUCTIONS)
+
+    @agent.output_validator
+    def check_findings_match_agent(
+        ctx: RunContext[Deps], batch: DeepenedBatch
+    ) -> DeepenedBatch:
+        """Reject findings filed against the wrong list.
+
+        The findings are merged into one buyer list by name, so a batch
+        declared as the other type would drop every low-confidence name it was
+        asked about — a silent deletion rather than a visible failure.
+        """
+        if batch.buyer_type != buyer_type:
+            raise ModelRetry(
+                f"These findings are declared {batch.buyer_type.value}, but you were "
+                f"asked about {buyer_type.value} buyers. Re-report them as "
+                f"{buyer_type.value} findings."
+            )
+        return batch
+
+    return agent
+
+
+strategic_deepen_agent = build_deepen_agent(BuyerType.STRATEGIC)
+sponsor_deepen_agent = build_deepen_agent(BuyerType.FINANCIAL_SPONSOR)
+
+DEEPEN_AGENTS: dict[BuyerType, Agent[Deps, DeepenedBatch]] = {
+    BuyerType.STRATEGIC: strategic_deepen_agent,
+    BuyerType.FINANCIAL_SPONSOR: sponsor_deepen_agent,
 }
 
 
@@ -227,6 +297,100 @@ async def _source_buyers(state: RunState, deps: Deps, buyer_type: BuyerType) -> 
     )
 
 
+_CANDIDATE_LIST_JSON = TypeAdapter(list[BuyerCandidate])
+
+
+def _deepen_prompt(profile: TargetProfile, candidates: list[BuyerCandidate]) -> str:
+    """The brief a deepen pass works from: the profile and the shaky names.
+
+    Only the low-confidence candidates are handed over. Including the rest
+    would invite the model to re-litigate buyers that are already evidenced,
+    and spend a bounded round on work the landscape does not need.
+    """
+    return (
+        "Re-research these low-confidence buyer candidates against the target "
+        "below. Confirm or refute each one.\n\n"
+        f"PROFILE:\n{profile.model_dump_json(indent=2)}\n\n"
+        "LOW-CONFIDENCE CANDIDATES:\n"
+        f"{_CANDIDATE_LIST_JSON.dump_json(candidates, indent=2).decode()}"
+    )
+
+
+async def _deepen_one_list(
+    state: RunState, deps: Deps, buyer_type: BuyerType, profile: TargetProfile
+) -> None:
+    """Re-research one list's low-confidence candidates and fold the result in."""
+    targets = state.low_confidence_buyers(buyer_type)
+    agent = DEEPEN_AGENTS[buyer_type]
+    result = await agent.run(_deepen_prompt(profile, targets), deps=deps)
+    batch = result.output
+
+    # As in `_source_buyers`: the agent's validator already checked this, so
+    # reaching here means DEEPEN_AGENTS is miswired.
+    if batch.buyer_type != buyer_type:
+        raise RuntimeError(
+            f"deepen pass for {buyer_type.value} returned {batch.buyer_type.value} findings"
+        )
+
+    # A candidate nothing came back for is dropped, so a pass that answers
+    # about the wrong names would quietly delete the list it was meant to
+    # resolve. Failing here costs the round and keeps the candidates, which
+    # the router can see and act on; a silent deletion it could not.
+    asked = {name_key(c.name) for c in targets}
+    answered = {name_key(f.original_name) for f in batch.findings}
+    if answered != asked:
+        raise RuntimeError(
+            f"deepen pass for {buyer_type.value} answered about the wrong candidates: "
+            f"unasked={sorted(answered - asked)}, unanswered={sorted(asked - answered)}"
+        )
+
+    before = len(state.buyers_for(buyer_type))
+    state.apply_deepening(buyer_type, batch.findings)
+    after = len(state.buyers_for(buyer_type))
+    log.info(
+        "deepened %d low-confidence %s buyers: %d dropped, %d remain: run_id=%s",
+        len(targets), buyer_type.value, before - after, after, state.run_id,
+    )
+
+
+async def _deepen_research(state: RunState, deps: Deps) -> None:
+    """Run one bounded deepen-research round over every list that needs one.
+
+    The cap counts rounds, not agent runs: a run where both specialists came
+    back shaky gets both lists re-researched together, for the price of the
+    one round the router asked for. The two guardrails come first so a round
+    the loop refuses to run, or has no work for, costs nothing — the router
+    sees the error in the next state summary and routes somewhere useful.
+
+    One list's pass failing is recorded and stepped over rather than raised,
+    so a dead source on the strategic side does not leave the sponsor list
+    carrying names nobody substantiated.
+    """
+    if state.deepen_rounds_used >= MAX_DEEPEN_ROUNDS:
+        state.errors.append("deepen_research requested past the round cap; ignoring")
+        return  # guardrail beats LLM enthusiasm
+
+    pending = [bt for bt in BuyerType if state.low_confidence_buyers(bt)]
+    if not pending:
+        state.errors.append(
+            "deepen_research requested with no low-confidence candidates; ignoring"
+        )
+        return
+
+    if state.profile is None:
+        raise RuntimeError("no profile yet; profile the target before deepening research")
+
+    state.deepen_rounds_used += 1
+    for buyer_type in pending:
+        try:
+            await _deepen_one_list(state, deps, buyer_type, state.profile)
+        except Exception as exc:  # noqa: BLE001 — degrade, don't crash
+            log.exception(
+                "deepen failed for %s (run_id=%s)", buyer_type.value, state.run_id
+            )
+            state.errors.append(f"deepen_research ({buyer_type.value}): {exc}")
+
+
 async def _run(target_input: str) -> RunState:
     state = RunState(run_id=uuid.uuid4().hex[:8], target_input=target_input)
     deps = build_deps(state.run_id)
@@ -234,7 +398,7 @@ async def _run(target_input: str) -> RunState:
 
     try:
         for iteration in range(MAX_ITERATIONS):
-            decision = (await router_agent.run(state.summary_for_router())).output
+            decision = (await router_agent.run(state.summary_for_router(MAX_DEEPEN_ROUNDS))).output
             log.info(
                 "routing: iter=%d step=%s reason=%r run_id=%s",
                 iteration, decision.next_step.value, decision.reason, state.run_id,
@@ -257,11 +421,7 @@ async def _run(target_input: str) -> RunState:
                     await _source_buyers(state, deps, BuyerType.FINANCIAL_SPONSOR)
 
                 elif decision.next_step == NextStep.DEEPEN_RESEARCH:
-                    if state.deepen_rounds_used >= MAX_DEEPEN_ROUNDS:
-                        state.errors.append("deepen_research requested past cap; ignoring")
-                        continue  # guardrail beats LLM enthusiasm
-                    state.deepen_rounds_used += 1
-                    ...  # re-run low-confidence candidates with a focused prompt
+                    await _deepen_research(state, deps)
 
                 elif decision.next_step == NextStep.SYNTHESIZE:
                     prompt = (
