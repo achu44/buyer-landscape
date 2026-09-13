@@ -10,6 +10,8 @@ being exercised is the tool's own wrapper around it.
 
 import asyncio
 import logging
+import re
+import time
 from collections.abc import Coroutine
 from typing import Any, TypeVar
 
@@ -48,6 +50,7 @@ def msft_info(**overrides: Any) -> dict[str, Any]:
         "longName": "Microsoft Corporation",
         "shortName": "Microsoft Corporation",
         "currency": "USD",
+        "financialCurrency": "USD",
         "exchange": "NMS",
         "sector": "Technology",
         "industry": "Software - Infrastructure",
@@ -141,7 +144,8 @@ def test_parses_a_ticker_into_structured_comps(monkeypatch: pytest.MonkeyPatch):
     assert isinstance(msft, CompanyComps)
     assert msft.ticker == "MSFT"
     assert msft.name == "Microsoft Corporation"
-    assert msft.currency == "USD"
+    assert msft.quote_currency == "USD"
+    assert msft.financial_currency == "USD"
     assert msft.sector == "Technology"
     assert msft.industry == "Software - Infrastructure"
     assert msft.market_cap == 3680323239936
@@ -178,6 +182,49 @@ def test_the_schema_the_model_sees_constrains_the_tickers():
     assert tickers["minItems"] == 1
     assert tickers["maxItems"] == MAX_TICKERS == 10
     assert tickers["items"]["maxLength"] == 15
+
+    # Loosely written symbols pass, since the tool normalises them; company
+    # names and index symbols are refused before any lookup is spent on them.
+    ticker_shape = re.compile(tickers["items"]["pattern"])
+    for accepted in ["MSFT", " msft ", "SIE.DE", "BRK-B"]:
+        assert ticker_shape.search(accepted), accepted
+    for refused in ["Microsoft Corp", "^GSPC", "EURUSD=X"]:
+        assert not ticker_shape.search(refused), refused
+
+
+def test_keeps_the_quote_currency_apart_from_the_reporting_currency(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An ADR trades in one currency and reports in another: TSM is quoted in
+    USD but its revenue and EBITDA come back in TWD (values observed live).
+    One currency field would have labelled trillions of TWD as USD."""
+    tsm = msft_info(
+        symbol="TSM",
+        longName="Taiwan Semiconductor Manufacturing Company Limited",
+        currency="USD",
+        financialCurrency="TWD",
+        totalRevenue=4440492343296,
+    )
+    stub_yahoo(monkeypatch, {"TSM": [tsm]})
+
+    [company] = run(comps_lookup(make_ctx(), tickers=["TSM"])).companies
+
+    assert company.quote_currency == "USD"
+    assert company.financial_currency == "TWD"
+    assert company.revenue_ttm == 4440492343296
+
+
+def test_an_unrecognisable_currency_code_is_unknown_not_fatal(monkeypatch: pytest.MonkeyPatch):
+    """London listings are quoted in pence ('GBp', observed live for BARC.L),
+    which is a real quote unit worth passing on; a reporting currency that is
+    not an ISO code is not, and becomes unknown rather than failing the company."""
+    barclays = msft_info(symbol="BARC.L", currency="GBp", financialCurrency="pounds")
+    stub_yahoo(monkeypatch, {"BARC.L": [barclays]})
+
+    [company] = run(comps_lookup(make_ctx(), tickers=["BARC.L"])).companies
+
+    assert company.quote_currency == "GBp"
+    assert company.financial_currency is None
 
 
 def test_a_company_with_gaps_in_its_data_still_comes_back(monkeypatch: pytest.MonkeyPatch):
@@ -264,6 +311,27 @@ def test_retries_a_transient_failure_with_the_shared_policy(
     results = run(comps_lookup(make_ctx(), tickers=["MSFT"]))
 
     assert stub.calls["MSFT"] == 3  # two failures + one success: the retry happened
+    assert [c.ticker for c in results.companies] == ["MSFT"]
+
+
+def test_a_read_that_hangs_times_out_and_is_retried(monkeypatch: pytest.MonkeyPatch):
+    """yfinance takes no timeout of its own worth waiting on, so the tool
+    bounds each read and treats hitting that bound like any other transient
+    failure."""
+    monkeypatch.setattr(tools.comps, "FETCH_TIMEOUT_SECONDS", 0.05)
+    calls = {"n": 0}
+
+    def hang_once_then_answer(symbol: str) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            time.sleep(0.5)
+        return type("Ticker", (), {"info": msft_info()})()
+
+    monkeypatch.setattr(tools.comps.yf, "Ticker", hang_once_then_answer)
+
+    results = run(comps_lookup(make_ctx(), tickers=["MSFT"]))
+
+    assert calls["n"] == 2  # the hung read timed out, the retry answered
     assert [c.ticker for c in results.companies] == ["MSFT"]
 
 

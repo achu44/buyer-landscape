@@ -210,23 +210,50 @@ class WebSearchResults(BaseModel):
     )
 
 
+# Longest Yahoo symbol accepted — shared by CompanyComps.ticker and the
+# `comps_lookup` argument so the two limits cannot drift apart.
+TICKER_MAX_CHARS = 15
+
+
 class CompanyComps(BaseModel):
     """Market data for one public company, as a specialist weighs a buyer's
     ability to pay or the multiple a comparable trades at. Every figure is
     optional: Yahoo leaves gaps (no EBITDA for a bank, no EV for a fund), and
     an honest null beats a guessed number an agent would quote as fact."""
 
-    ticker: str = Field(pattern=r"^[A-Z0-9][A-Z0-9.\-]{0,14}$", description="Yahoo symbol, e.g. 'MSFT' or 'SIE.DE'")
+    ticker: str = Field(
+        pattern=rf"^[A-Z0-9][A-Z0-9.\-]{{0,{TICKER_MAX_CHARS - 1}}}$",
+        description="Yahoo symbol, e.g. 'MSFT' or 'SIE.DE'",
+    )
     name: str = Field(min_length=1)
-    currency: str | None = Field(default=None, description="ISO code the figures below are quoted in")
-    sector: str | None = None
-    industry: str | None = None
-    market_cap: float | None = Field(default=None, ge=0)
+    # Two currencies, because a cross-listed company trades in one and reports
+    # in another: TSM is quoted in USD but reports in TWD.
+    quote_currency: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Unit the share price is quoted in — usually ISO, but e.g. 'GBp' (pence) in London",
+    )
+    financial_currency: str | None = Field(
+        default=None,
+        pattern=r"^[A-Z]{3}$",
+        description="ISO code of the reported figures: revenue_ttm and ebitda_ttm",
+    )
+    sector: str | None = Field(default=None, min_length=1)
+    industry: str | None = Field(default=None, min_length=1)
+    market_cap: float | None = Field(
+        default=None,
+        ge=0,
+        description="As Yahoo reports it; for a cross-listed company check it against financial_currency before comparing",
+    )
     # Can legitimately be negative for a company holding more cash than its
     # market cap plus debt, so unlike market_cap it carries no lower bound.
     enterprise_value: float | None = None
-    revenue_ttm: float | None = Field(default=None, ge=0, description="Trailing-twelve-month revenue")
-    ebitda_ttm: float | None = Field(default=None, description="Trailing-twelve-month EBITDA; may be negative")
+    revenue_ttm: float | None = Field(
+        default=None, ge=0, description="Trailing-twelve-month revenue, in financial_currency"
+    )
+    ebitda_ttm: float | None = Field(
+        default=None, description="Trailing-twelve-month EBITDA, in financial_currency; may be negative"
+    )
     ev_to_revenue: float | None = None
     ev_to_ebitda: float | None = None
     revenue_growth: float | None = Field(default=None, description="Year-over-year, as a fraction: 0.18 is 18%")

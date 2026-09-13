@@ -25,10 +25,10 @@ import yfinance as yf
 # yfinance re-exports whichever HTTP backend it loaded (curl_cffi, or requests
 # as a fallback), so its exception classes are the ones that actually reach us.
 from yfinance._http import requests as yf_requests
-from yfinance.exceptions import YFRateLimitError
+from yfinance.exceptions import YFException, YFRateLimitError
 
 from deps import Deps, retry_kwargs
-from schemas import CompanyComps, CompsResults, SkippedTicker, SkipReason
+from schemas import TICKER_MAX_CHARS, CompanyComps, CompsResults, SkippedTicker, SkipReason
 
 log = logging.getLogger("comps")
 
@@ -36,9 +36,10 @@ log = logging.getLogger("comps")
 # yfinance read, so the cap also bounds how long one tool call can take.
 MAX_TICKERS = 10
 
-# Matches CompanyComps.ticker, so a symbol the schema would reject is refused
-# at the tool boundary instead of partway through a lookup.
-MAX_TICKER_CHARS = 15
+# A Yahoo symbol as a model might write one — any case, padded, since the tool
+# normalises both. Company names and index or FX symbols ('^GSPC', 'EURUSD=X')
+# are refused by the tool schema before a lookup is spent on them.
+TICKER_ARGUMENT_PATTERN = r"^\s*[A-Za-z0-9][A-Za-z0-9.\-]*\s*$"
 
 # yfinance's `info` makes two or three requests under the hood, so one read
 # gets double the shared HTTP client's 10s per-request timeout. yfinance's own
@@ -72,6 +73,20 @@ def _is_transient(exc: BaseException) -> bool:
             TimeoutError,
         ),
     )
+
+
+# Everything a yfinance read can fail with once the retries are done: its own
+# exceptions (rate limiting included), its HTTP backend's, our timeout, and the
+# lookup/parse errors its scrapers raise when Yahoo changes a response shape.
+_YAHOO_FAILURES: tuple[type[Exception], ...] = (
+    YFException,
+    yf_requests.exceptions.RequestException,
+    TimeoutError,
+    KeyError,
+    IndexError,
+    TypeError,
+    ValueError,
+)
 
 
 async def _fetch_info_with_retry(ticker: str, run_id: str) -> dict[str, Any]:
@@ -110,11 +125,21 @@ def _text(info: dict[str, Any], key: str) -> str | None:
     return value.strip() or None
 
 
+def _iso_currency(info: dict[str, Any], key: str) -> str | None:
+    """A reporting currency is only worth passing on as an ISO code: anything
+    else would mislabel every figure it applies to, so it becomes unknown."""
+    value = _text(info, key)
+    if value is None or len(value) != 3 or not (value.isascii() and value.isalpha() and value.isupper()):
+        return None
+    return value
+
+
 def _comps_from_info(ticker: str, info: dict[str, Any]) -> CompanyComps:
     return CompanyComps(
         ticker=ticker,
         name=_text(info, "longName") or _text(info, "shortName") or ticker,
-        currency=_text(info, "currency"),
+        quote_currency=_text(info, "currency"),
+        financial_currency=_iso_currency(info, "financialCurrency"),
         sector=_text(info, "sector"),
         industry=_text(info, "industry"),
         market_cap=_number(info, "marketCap", non_negative=True),
@@ -132,7 +157,12 @@ def _comps_from_info(ticker: str, info: dict[str, Any]) -> CompanyComps:
 async def comps_lookup(
     ctx: RunContext[Deps],
     tickers: Annotated[
-        list[Annotated[str, Field(min_length=1, max_length=MAX_TICKER_CHARS)]],
+        list[
+            Annotated[
+                str,
+                Field(min_length=1, max_length=TICKER_MAX_CHARS, pattern=TICKER_ARGUMENT_PATTERN),
+            ]
+        ],
         Field(min_length=1, max_length=MAX_TICKERS),
     ],
 ) -> CompsResults:
@@ -158,14 +188,13 @@ async def comps_lookup(
     for ticker in dict.fromkeys(t.strip().upper() for t in tickers):
         try:
             info = await _fetch_info_with_retry(ticker, deps.run_id)
-        except Exception as exc:
-            # Broad on purpose: yfinance scrapes an unofficial API and can raise
-            # almost anything when Yahoo changes a response, and none of it
-            # should crash the agent run. If the error was transient the retries
-            # already ran to exhaustion; if not, it was never going to improve.
-            # Either way terminal, and the agent should fall back.
-            # Either way it is terminal for this ticker only: the rest of the
-            # comp set is still worth returning (ADR 0003).
+        except _YAHOO_FAILURES as exc:
+            # A transient failure only gets here once the retries ran out; the
+            # rest (Yahoo answered, yfinance couldn't read it) were never going
+            # to improve. Either way terminal for this ticker only — the rest of
+            # the comp set is still worth returning (ADR 0003). Named rather
+            # than `except Exception`, as in tools/web.py, so a bug in this
+            # module crashes instead of posing as a Yahoo outage.
             log.warning(
                 "comps lookup failed: run_id=%s ticker=%s transient=%s error=%r",
                 deps.run_id, ticker, _is_transient(exc), exc,
