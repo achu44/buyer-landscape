@@ -16,6 +16,7 @@ retry with the same policy and log with the same run_id convention.
 from collections.abc import Callable
 from dataclasses import dataclass
 import logging
+import os
 from typing import Any
 
 import httpx
@@ -33,6 +34,10 @@ REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 MAX_ATTEMPTS = 4
 BACKOFF_MULTIPLIER = 0.5
 BACKOFF_MAX = 8.0
+
+# Where the mock CRM's SQLite file lives. Read from the environment so a demo
+# run and a test run never share a database.
+CRM_DB_PATH = os.environ.get("CRM_DB_PATH", "crm.db")
 
 
 def is_transient_error(exc: BaseException) -> bool:
@@ -121,11 +126,25 @@ def build_http_client(
 class Deps:
     """Shared dependency object passed to every research agent via
     `deps_type`. Tools reach shared resources through `ctx.deps` instead of
-    a module-level global (docs/adr/0002-shared-deps-for-tool-resources.md)."""
+    a module-level global (docs/adr/0002-shared-deps-for-tool-resources.md).
+
+    The CRM writer is not an agent tool, but its database is still a resource
+    of the run: carrying the path here lets a test point the CRM-write step at
+    a temporary database the same way it swaps in a mock HTTP transport."""
 
     http_client: httpx.AsyncClient
     run_id: str
+    crm_db_path: str = CRM_DB_PATH
 
 
-def build_deps(run_id: str, *, transport: httpx.AsyncBaseTransport | None = None) -> Deps:
-    return Deps(http_client=build_http_client(run_id, transport=transport), run_id=run_id)
+def build_deps(
+    run_id: str,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    crm_db_path: str = CRM_DB_PATH,
+) -> Deps:
+    return Deps(
+        http_client=build_http_client(run_id, transport=transport),
+        run_id=run_id,
+        crm_db_path=crm_db_path,
+    )

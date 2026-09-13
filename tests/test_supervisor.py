@@ -8,7 +8,10 @@ agent actually carries the research tools rather than just claiming to in its
 instructions.
 """
 
+import asyncio
 from contextlib import ExitStack
+from pathlib import Path
+import sqlite3
 from typing import Any
 
 import pytest
@@ -18,7 +21,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 import supervisor
 from deps import Deps, build_deps
-from schemas import BuyerType, RunState
+from schemas import BuyerLandscape, BuyerType, NextStep, RunState
 
 RUN_ID = "run-test01"
 
@@ -517,3 +520,109 @@ def test_a_pass_answering_about_the_wrong_candidates_keeps_the_list() -> None:
 
     assert [b.name for b in state.strategic_buyers] == ["Air Liquide"]
     assert any("wrong candidates" in e for e in state.errors)
+
+
+# ---------------------------------------------------------------------------
+# CRM write: a finished landscape is persisted, without running the pipeline
+# ---------------------------------------------------------------------------
+
+SUMMARY = (
+    "Chart Industries draws interest from both strategic acquirers and "
+    "financial sponsors. Industrial-gas majors see a direct adjacency in "
+    "cryogenic storage and transport, while sponsors with energy-transition "
+    "theses view it as a platform for hydrogen infrastructure bolt-ons."
+)
+
+
+def landscape_with_five_buyers() -> BuyerLandscape:
+    return BuyerLandscape.model_validate(
+        {
+            "target": PROFILE,
+            "strategic_buyers": [
+                candidate("Air Liquide", BuyerType.STRATEGIC),
+                candidate("Linde", BuyerType.STRATEGIC),
+                candidate("Air Products", BuyerType.STRATEGIC, "medium"),
+            ],
+            "sponsor_buyers": [
+                candidate("Apollo", BuyerType.FINANCIAL_SPONSOR),
+                candidate("KKR", BuyerType.FINANCIAL_SPONSOR, "low"),
+            ],
+            "summary": SUMMARY,
+        }
+    )
+
+
+@pytest.fixture
+def crm_db(tmp_path: Path) -> Path:
+    return tmp_path / "crm.db"
+
+
+@pytest.fixture
+def crm_deps(crm_db: Path) -> Deps:
+    return build_deps(RUN_ID, crm_db_path=str(crm_db))
+
+
+def crm_rows(crm_db: Path, sql: str) -> list[tuple[Any, ...]]:
+    conn = sqlite3.connect(crm_db)
+    try:
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+def test_write_to_crm_persists_the_landscape_and_marks_the_run_written(
+    crm_deps: Deps, crm_db: Path
+) -> None:
+    """Seeded straight to a finished landscape: no agent or tool runs, so this
+    exercises the CRM-write step alone."""
+    state = RunState(
+        run_id=RUN_ID, target_input="Chart Industries", landscape=landscape_with_five_buyers()
+    )
+
+    asyncio.run(supervisor.dispatch(state, crm_deps, NextStep.WRITE_TO_CRM))
+
+    assert crm_rows(crm_db, "SELECT name, run_id FROM accounts") == [
+        ("Chart Industries", RUN_ID)
+    ]
+    assert sorted(crm_rows(crm_db, "SELECT buyer_name, buyer_type FROM opportunities")) == [
+        ("Air Liquide", "strategic"),
+        ("Air Products", "strategic"),
+        ("Apollo", "financial_sponsor"),
+        ("KKR", "financial_sponsor"),
+        ("Linde", "strategic"),
+    ]
+    # One Note per Opportunity, plus the summary Note on the Account.
+    assert crm_rows(crm_db, "SELECT COUNT(*) FROM notes") == [(6,)]
+    assert state.crm_written is True
+    assert state.errors == []
+
+
+def test_a_second_crm_write_is_refused_rather_than_duplicating_the_account(
+    crm_deps: Deps, crm_db: Path
+) -> None:
+    """The writer always appends a fresh Account, so a router that asks twice
+    would log the same run as two analyses. The guardrail holds it to one."""
+    state = RunState(
+        run_id=RUN_ID, target_input="Chart Industries", landscape=landscape_with_five_buyers()
+    )
+
+    asyncio.run(supervisor.dispatch(state, crm_deps, NextStep.WRITE_TO_CRM))
+    asyncio.run(supervisor.dispatch(state, crm_deps, NextStep.WRITE_TO_CRM))
+
+    assert crm_rows(crm_db, "SELECT COUNT(*) FROM accounts") == [(1,)]
+    assert state.crm_written is True
+    assert any("already written" in e for e in state.errors)
+
+
+def test_write_to_crm_without_a_landscape_fails_and_writes_nothing(
+    crm_deps: Deps, crm_db: Path
+) -> None:
+    """Nothing synthesized yet: the step raises for the loop to record, and
+    the run is not marked written for the router to wrongly finish on."""
+    state = RunState(run_id=RUN_ID, target_input="Chart Industries")
+
+    with pytest.raises(RuntimeError, match="no landscape"):
+        asyncio.run(supervisor.dispatch(state, crm_deps, NextStep.WRITE_TO_CRM))
+
+    assert state.crm_written is False
+    assert not crm_db.exists()
