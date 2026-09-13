@@ -61,15 +61,24 @@ def _log_retry(run_id: str, logger: logging.Logger) -> Callable[[RetryCallState]
     return _log
 
 
-def retry_kwargs(run_id: str, logger: logging.Logger = log) -> dict[str, Any]:
+def retry_kwargs(
+    run_id: str,
+    logger: logging.Logger = log,
+    *,
+    is_transient: Callable[[BaseException], bool] = is_transient_error,
+) -> dict[str, Any]:
     """The project's standard retry-with-backoff policy: bounded attempts,
     exponential wait, transient-only, and a log line carrying `run_id` on
     every retry. Shared by the HTTP transport below and usable directly with
-    `tenacity.retry`/`Retrying`/`AsyncRetrying` by any non-HTTP tool."""
+    `tenacity.retry`/`Retrying`/`AsyncRetrying` by any non-HTTP caller.
+
+    `is_transient` is the one part that varies: httpx, yfinance and the LLM
+    provider each raise their own exceptions, so each caller says which of
+    them are worth another attempt."""
     return dict(
         stop=stop_after_attempt(MAX_ATTEMPTS),
         wait=wait_exponential(multiplier=BACKOFF_MULTIPLIER, max=BACKOFF_MAX),
-        retry=retry_if_exception(is_transient_error),
+        retry=retry_if_exception(is_transient),
         before_sleep=_log_retry(run_id, logger),
         reraise=True,
     )

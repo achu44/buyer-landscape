@@ -19,9 +19,12 @@ from pydantic_ai.settings import ModelSettings
 
 import deps
 import llm
+from tests.fakes import MODEL_NAME, ProviderDown
 
 RUN_ID = "run-llm001"
-MODEL_NAME = "claude-test"
+
+# Backoff is zeroed for every test here; see the module docstring.
+pytestmark = pytest.mark.usefixtures("no_backoff")
 
 
 class Answer(BaseModel):
@@ -36,28 +39,20 @@ class FailingThenAnswering:
     """A FunctionModel function that raises each of `failures` in turn, then
     answers. Counts requests so a test can tell a retry from a single call."""
 
-    def __init__(self, *failures: BaseException, forever: bool = False):
+    def __init__(self, *failures: BaseException):
         self.failures = failures
-        self.forever = forever
         self.calls = 0
         self.settings_seen: list[ModelSettings | None] = []
 
     def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         self.calls += 1
         self.settings_seen.append(info.model_settings)
-        if self.forever:
-            raise self.failures[0]
         if self.calls <= len(self.failures):
             raise self.failures[self.calls - 1]
         return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"verdict": "ok"})])
 
 
-@pytest.fixture(autouse=True)
-def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(deps, "BACKOFF_MULTIPLIER", 0)
-
-
-def agent_answering_with(respond: FailingThenAnswering) -> Agent[None, Answer]:
+def agent_answering_with(respond: FailingThenAnswering | ProviderDown) -> Agent[None, Answer]:
     return Agent(FunctionModel(respond), output_type=Answer, name="test_agent")
 
 
@@ -95,7 +90,7 @@ def test_transient_failures_are_retried_until_the_run_succeeds() -> None:
 
 
 def test_a_run_that_exhausts_its_retry_budget_raises_the_last_error() -> None:
-    respond = FailingThenAnswering(http_error(503), forever=True)
+    respond = ProviderDown(503)
 
     with pytest.raises(ModelHTTPError):
         asyncio.run(llm.run_agent(agent_answering_with(respond), "q", run_id=RUN_ID))
@@ -104,7 +99,7 @@ def test_a_run_that_exhausts_its_retry_budget_raises_the_last_error() -> None:
 
 
 def test_a_terminal_failure_is_not_retried() -> None:
-    respond = FailingThenAnswering(http_error(401), forever=True)
+    respond = ProviderDown(401)
 
     with pytest.raises(ModelHTTPError):
         asyncio.run(llm.run_agent(agent_answering_with(respond), "q", run_id=RUN_ID))
@@ -134,3 +129,16 @@ def test_retry_and_completion_log_lines_carry_run_id(caplog: pytest.LogCaptureFi
     assert retries and completions
     assert all(RUN_ID in r.message for r in retries + completions)
     assert all("test_agent" in r.message for r in completions)
+
+
+def test_the_provider_sdk_does_not_retry_underneath_the_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Anthropic SDK retries on its own by default. Left on, each attempt
+    here would be up to three requests the run_id log never sees — so the
+    model is built with that layer off, and without needing a key to exist."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    model = llm.build_model()
+
+    assert model.client.max_retries == 0

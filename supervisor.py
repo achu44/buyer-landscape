@@ -18,7 +18,7 @@ from pydantic import TypeAdapter
 from pydantic_ai import Agent, ModelRetry, RunContext
 
 from deps import Deps, build_deps
-from llm import run_agent
+from llm import build_model, run_agent
 from schemas import (
     BuyerCandidate,
     BuyerCandidateBatch,
@@ -45,7 +45,7 @@ log = logging.getLogger("supervisor")
 MAX_ITERATIONS = 12       # hard cap: the loop can never run away
 MAX_DEEPEN_ROUNDS = 2     # low-confidence re-research is bounded
 
-MODEL = "anthropic:claude-sonnet-4-6"  # pick per docs; cheap+fast is fine here
+MODEL = build_model()  # model choice and its retry/timeout policy live in llm.py
 
 # Every research agent gets the same three tools: the specialists and the
 # profiler ask the same kinds of question (who filed what, what was reported,
@@ -53,11 +53,6 @@ MODEL = "anthropic:claude-sonnet-4-6"  # pick per docs; cheap+fast is fine here
 # Plain functions attached here rather than `@agent.tool` decorators, so one
 # tool serves all three agents — docs/adr/0002-shared-deps-for-tool-resources.md.
 RESEARCH_TOOLS = [edgar_search, web_search, comps_lookup]
-
-# Every agent below passes `defer_model_check=True`, which resolves MODEL at
-# first run instead of at import. Without it, importing this module raises
-# UserError when ANTHROPIC_API_KEY is unset, which would make the agents
-# untestable — tests override the model and never reach a provider at all.
 
 # ---------------------------------------------------------------------------
 # Agents. Each declares its output schema; Pydantic AI validates the model's
@@ -83,7 +78,6 @@ router_agent = Agent(
         "- Everything complete -> done."
     ),
     retries=2,  # validation-failure retries
-    defer_model_check=True,
 )
 
 profiler_agent = Agent(
@@ -98,7 +92,6 @@ profiler_agent = Agent(
     ),
     tools=RESEARCH_TOOLS,
     retries=2,
-    defer_model_check=True,
 )
 
 synthesis_agent = Agent(
@@ -111,7 +104,6 @@ synthesis_agent = Agent(
         "Do not invent buyers not present in the inputs."
     ),
     retries=2,
-    defer_model_check=True,
 )
 
 STRATEGIC_INSTRUCTIONS = (
@@ -160,7 +152,6 @@ def build_buyer_agent[OutputT](
         instructions=instructions,
         tools=RESEARCH_TOOLS,
         retries=2,
-        defer_model_check=True,
     )
 
 

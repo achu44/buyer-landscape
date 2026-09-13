@@ -22,6 +22,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 import deps as deps_module
 import supervisor
+from tests.fakes import MODEL_NAME, ProviderDown
 from deps import Deps, build_deps
 from schemas import BuyerLandscape, BuyerType, NextStep, RunState
 
@@ -634,28 +635,11 @@ def test_write_to_crm_without_a_landscape_fails_and_writes_nothing(
 # External-call policy: provider failures are retried, then degrade
 # ---------------------------------------------------------------------------
 
-class ProviderDown:
-    """A FunctionModel function for a provider that answers every request
-    with the same HTTP error, counting how many requests it was sent."""
-
-    def __init__(self, status_code: int = 503):
-        self.status_code = status_code
-        self.calls = 0
-
-    def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        self.calls += 1
-        raise ModelHTTPError(status_code=self.status_code, model_name="claude-test")
-
-
-@pytest.fixture
-def no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(deps_module, "BACKOFF_MULTIPLIER", 0)
-
-
 @pytest.mark.usefixtures("no_backoff")
 def test_a_step_whose_provider_stays_down_degrades_into_run_errors() -> None:
-    """The profiler's provider is overloaded for every attempt: the step is
-    retried up to the budget, then recorded for the router — not a crash."""
+    """The profiler's provider is overloaded for every attempt: the provider
+    call is re-attempted up to the budget, then the step's failure is recorded
+    for the router — not a crash."""
     profiler = ProviderDown(529)
 
     state = pipeline(["profile_target"], profiler_agent=profiler)
@@ -685,7 +669,7 @@ def test_a_transient_provider_blip_does_not_fail_the_step() -> None:
         def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
             if self.calls == 0:
                 self.calls += 1
-                raise ModelHTTPError(status_code=529, model_name="claude-test")
+                raise ModelHTTPError(status_code=529, model_name=MODEL_NAME)
             return super().__call__(messages, info)
 
     state = pipeline(["profile_target"], profiler_agent=BlipThenProfile(PROFILE))

@@ -25,7 +25,6 @@ from pydantic_ai.usage import RunUsage
 from yfinance._http import requests as yf_requests
 from yfinance.exceptions import YFDataException, YFRateLimitError
 
-import deps
 import tools.comps
 from deps import MAX_ATTEMPTS, Deps, build_deps
 from schemas import CompanyComps, CompsResults, SkippedTicker, SkipReason
@@ -115,11 +114,7 @@ class YahooStub:
             return outcome
 
 
-@pytest.fixture(autouse=True)
-def _no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep the shared backoff policy but without the real sleeps, so the
-    retry tests run in milliseconds."""
-    monkeypatch.setattr(deps, "BACKOFF_MULTIPLIER", 0)
+pytestmark = pytest.mark.usefixtures("no_backoff")
 
 
 def stub_yahoo(
