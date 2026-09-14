@@ -6,7 +6,14 @@ import sqlite3
 
 import pytest
 
-from schemas import BuyerCandidate, BuyerLandscape, BuyerType, Confidence, TargetProfile
+from schemas import (
+    BuyerCandidate,
+    BuyerLandscape,
+    BuyerType,
+    Confidence,
+    TargetProfile,
+    TransactionStatus,
+)
 from tools.crm import CONFIDENCE_TO_STAGE, write_to_crm
 
 RUN_ID = "run-abc123"
@@ -40,6 +47,7 @@ def make_profile() -> TargetProfile:
         sector="Industrials",
         subsector="Cryogenic Equipment",
         is_public=True,
+        transaction_status=TransactionStatus.INDEPENDENT,
         est_revenue_band="$3B-$4B",
         key_assets=["LNG liquefaction IP", "Hydrogen storage patents"],
         geographies=["United States", "Europe"],

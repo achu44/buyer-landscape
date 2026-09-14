@@ -34,6 +34,7 @@ from schemas import (
     RouterDecision,
     RunState,
     TargetProfile,
+    TransactionStatus,
     name_key,
 )
 from tools.comps import comps_lookup
@@ -100,6 +101,7 @@ router_agent = Agent(
         "step.\n"
         "Rules of thumb:\n"
         "- No profile yet -> profile_target.\n"
+        "- Target transaction status is acquired -> done: a sold company has no buyers to source.\n"
         "- Profile exists but a buyer list is empty -> find that buyer type.\n"
         "- Many low-confidence buyers and deepen rounds remain -> deepen_research.\n"
         "- Both lists populated with adequate confidence -> synthesize.\n"
@@ -117,7 +119,11 @@ profiler_agent = Agent(
     instructions=(
         "Build a structured profile of the target company. Use your tools "
         "(web search, SEC EDGAR) and cite sources. If revenue is unknowable, "
-        "say 'unknown' — do not guess."
+        "say 'unknown' — do not guess.\n"
+        "Check whether the company is still available to buy: search for an "
+        "announced, agreed or completed acquisition of it. Report independent, "
+        "pending (agreed or announced, not closed) or acquired (closed), and for "
+        "the latter two give the acquirer, the dates you found, and the sources."
     ),
     tools=RESEARCH_TOOLS,
     retries=2,
@@ -132,7 +138,9 @@ synthesis_agent = Agent(
         "the target's profile and both buyer lists, already ranked by fit_score. "
         "Summarize who the most credible buyers are and why, across strategic "
         "acquirers and financial sponsors, drawing only on the rationale and "
-        "signals provided. Refer only to buyers in the lists."
+        "signals provided. Refer only to buyers in the lists.\n"
+        "If the profile's transaction_status is pending, open the summary with "
+        "that deal — the acquirer and where it stands — before the buyer analysis."
     ),
     retries=2,
 )
@@ -308,6 +316,14 @@ async def _source_buyers(state: RunState, deps: Deps, buyer_type: BuyerType) -> 
     """
     if state.profile is None:
         raise RuntimeError("no profile yet; profile the target before sourcing buyers")
+
+    # A closed sale leaves nobody to sell to. Checked in code rather than left
+    # to the router's judgment, because sourcing is the most expensive step in
+    # the run and its output would answer a question nobody asked.
+    if state.profile.transaction_status is TransactionStatus.ACQUIRED:
+        raise RuntimeError(
+            f"target already {state.profile.describe_transaction()}; there are no buyers to source"
+        )
 
     agent = SPECIALIST_AGENTS[buyer_type]
     batch = await run_agent(
@@ -601,6 +617,9 @@ def run(target_input: str) -> RunState:
 
 
 if __name__ == "__main__":
-    final = run("Chart Industries — cryogenic equipment for LNG and hydrogen")
+    final = run(
+        "Graham Corporation — vacuum, heat transfer and cryogenic pump equipment "
+        "for defense, space and energy"
+    )
     if final.landscape:
         print(final.landscape.model_dump_json(indent=2))

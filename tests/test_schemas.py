@@ -16,6 +16,7 @@ from schemas import (
     DeepenedCandidate,
     DeepenVerdict,
     RunState,
+    TargetProfile,
 )
 
 RATIONALE = (
@@ -260,6 +261,7 @@ PROFILE = {
     "sector": "Industrials",
     "subsector": "Cryogenic equipment",
     "is_public": True,
+    "transaction_status": "independent",
     "est_revenue_band": "$1B-$5B",
     "key_assets": ["Cryogenic tank manufacturing footprint"],
     "geographies": ["United States"],
@@ -290,3 +292,50 @@ def test_landscape_needs_the_minimum_number_of_buyers(buyer_count: int):
             build()
     else:
         assert len(build().strategic_buyers) == buyer_count - 1
+
+
+DEAL = {
+    "acquirer": "Baker Hughes",
+    "announced_on": "2025-07-29",
+    "closed_on": "2026-07-16",
+    "sources": ["https://example.com/baker-hughes-completes-acquisition"],
+}
+
+
+def profile_with(**overrides: Any) -> dict[str, Any]:
+    return {**PROFILE, **overrides}
+
+
+def test_transaction_status_is_required():
+    """The profiler has to answer the question, not skip it by default."""
+    unstated = {k: v for k, v in PROFILE.items() if k != "transaction_status"}
+    with pytest.raises(ValidationError):
+        TargetProfile.model_validate(unstated)
+
+
+@pytest.mark.parametrize(
+    ("status", "deal"),
+    [("independent", DEAL), ("pending", None), ("acquired", None)],
+)
+def test_transaction_status_and_deal_must_agree(status: str, deal: dict[str, Any] | None):
+    with pytest.raises(ValidationError):
+        TargetProfile.model_validate(profile_with(transaction_status=status, deal=deal))
+
+
+@pytest.mark.parametrize(
+    "deal",
+    [{**DEAL, "acquirer": ""}, {**DEAL, "sources": []}],
+    ids=["no-acquirer", "no-source"],
+)
+def test_a_deal_needs_an_acquirer_and_a_source(deal: dict[str, Any]):
+    with pytest.raises(ValidationError):
+        TargetProfile.model_validate(profile_with(transaction_status="acquired", deal=deal))
+
+
+def test_router_summary_reports_the_targets_transaction_status():
+    acquired = TargetProfile.model_validate(profile_with(transaction_status="acquired", deal=DEAL))
+
+    assert "Target transaction status: acquired by Baker Hughes (closed 2026-07-16)" in (
+        make_state(profile=acquired).summary_for_router(2)
+    )
+    assert "Target transaction status: unknown (no profile yet)" in make_state().summary_for_router(2)

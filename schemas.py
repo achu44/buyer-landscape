@@ -26,6 +26,16 @@ class Confidence(str, Enum):
     LOW = "low"
 
 
+class TransactionStatus(str, Enum):
+    """Whether the target is still available to buy. A company under a signed
+    agreement can still draw a topping bid; one whose sale has closed cannot,
+    and a landscape of its potential buyers answers a question nobody asked."""
+
+    INDEPENDENT = "independent"
+    PENDING = "pending"        # a sale is agreed or announced but not closed
+    ACQUIRED = "acquired"      # a sale has closed
+
+
 class NextStep(str, Enum):
     """The supervisor's routing vocabulary. LLM output picks one of these,
     and that choice determines the next step — this is the 'dynamic routing'
@@ -55,6 +65,15 @@ def name_key(name: str) -> str:
 # Agent outputs
 # ---------------------------------------------------------------------------
 
+class TargetDeal(BaseModel):
+    """An agreed or completed sale of the target, as the profiler found it."""
+
+    acquirer: str = Field(min_length=1)
+    announced_on: date | None = None
+    closed_on: date | None = None
+    sources: list[str] = Field(min_length=1, description="Press releases or filings reporting the deal")
+
+
 class TargetProfile(BaseModel):
     """Output of the target profiler agent."""
 
@@ -67,6 +86,34 @@ class TargetProfile(BaseModel):
     key_assets: list[str] = Field(min_length=1, max_length=8)
     geographies: list[str] = Field(min_length=1)
     sources: list[str] = Field(min_length=1, description="URLs or filings backing this profile")
+    transaction_status: TransactionStatus = Field(
+        description="independent, pending (sale agreed or announced, not closed), or acquired (sale closed)"
+    )
+    deal: TargetDeal | None = Field(
+        default=None, description="The agreed or completed sale. Required unless independent; omit when independent"
+    )
+
+    @model_validator(mode="after")
+    def check_deal_matches_status(self) -> "TargetProfile":
+        if self.transaction_status is TransactionStatus.INDEPENDENT:
+            if self.deal is not None:
+                raise ValueError("an independent target carries no deal; omit it or change the status")
+        elif self.deal is None:
+            raise ValueError(
+                f"a {self.transaction_status.value} target needs its deal: acquirer and sources"
+            )
+        return self
+
+    def describe_transaction(self) -> str:
+        """One line on the target's availability, for the router prompt."""
+        deal = self.deal
+        if self.transaction_status is TransactionStatus.INDEPENDENT or deal is None:
+            return "independent"
+        if self.transaction_status is TransactionStatus.ACQUIRED:
+            closed = f" (closed {deal.closed_on.isoformat()})" if deal.closed_on else ""
+            return f"acquired by {deal.acquirer}{closed}"
+        announced = f" (announced {deal.announced_on.isoformat()})" if deal.announced_on else ""
+        return f"pending sale to {deal.acquirer}{announced}"
 
 
 class BuyerCandidate(BaseModel):
@@ -508,6 +555,8 @@ class RunState(BaseModel):
         return (
             f"Target input: {self.target_input}\n"
             f"Profile built: {self.profile is not None}\n"
+            f"Target transaction status: "
+            f"{self.profile.describe_transaction() if self.profile else 'unknown (no profile yet)'}\n"
             f"Strategic buyers found: {len(self.strategic_buyers)} "
             f"(low-confidence: {len(self.low_confidence_buyers(BuyerType.STRATEGIC))})\n"
             f"Sponsor buyers found: {len(self.sponsor_buyers)} "
