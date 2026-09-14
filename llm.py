@@ -34,7 +34,11 @@ from deps import retry_kwargs
 
 log = logging.getLogger("llm")
 
-MODEL_NAME = "claude-sonnet-4-6"  # pick per docs; cheap+fast is fine here
+# Claude Haiku 4.5: $1 / $5 per 1M input / output tokens, a third of Sonnet
+# 4.6 on both. Chosen for cost — a full live run on Sonnet 4.6 cost several
+# dollars (issue #29). 200K context and a 64K output cap; every single request
+# in a run so far has been well inside both.
+MODEL_NAME = "claude-haiku-4-5"
 
 # Per model request, not per agent run: a research run makes many requests
 # with tool calls in between, and only a single hung request is worth cutting
@@ -72,6 +76,9 @@ def build_model() -> AnthropicModel:
         max_tokens=MAX_OUTPUT_TOKENS,
         # A research run resends its whole growing tool history on every
         # request; caching bills that repeated prefix at the cache-read rate.
+        # Haiku 4.5 only caches prompts of 4096+ tokens, so the ~1K-token
+        # router calls go uncached — harmless, since the research agents'
+        # resent histories are where the repeated tokens are.
         anthropic_cache=True,
     )
     return AnthropicModel(

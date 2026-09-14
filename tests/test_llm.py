@@ -206,3 +206,16 @@ def test_an_answer_cut_off_at_the_token_limit_fails_the_run_at_once(
         asyncio.run(llm.run_agent(agent_answering_with(respond), "q", run_id=RUN_ID))
 
     assert respond.calls == 1
+
+
+def test_agents_run_on_haiku_within_its_output_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The model is a cost decision (Haiku 4.5 is a third of Sonnet 4.6's
+    price), so it is pinned here: changing it should be a deliberate edit,
+    not a drive-by. The output budget has to fit the model's own cap, or
+    every request is rejected before it runs."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    model = llm.build_model()
+
+    assert model.model_name == "claude-haiku-4-5"
+    assert llm.MAX_OUTPUT_TOKENS <= 64_000  # Haiku 4.5's max output tokens
