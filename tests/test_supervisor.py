@@ -57,6 +57,7 @@ PROFILE = {
     "sector": "Industrials",
     "subsector": "Cryogenic equipment",
     "is_public": True,
+    "transaction_status": "independent",
     "est_revenue_band": "$1B-$5B",
     "key_assets": ["Cryogenic tank manufacturing footprint"],
     "geographies": ["United States"],
@@ -1153,3 +1154,63 @@ def test_a_record_that_cannot_be_written_is_logged_not_raised(
 
     assert state.profile is not None
     assert f"run record not written: run_id={state.run_id}" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Transaction status: a target that is already sold has no buyers to source
+# ---------------------------------------------------------------------------
+
+DEAL = {
+    "acquirer": "Baker Hughes",
+    "announced_on": "2025-07-29",
+    "closed_on": "2026-07-16",
+    "sources": ["https://example.com/baker-hughes-completes-acquisition"],
+}
+ACQUIRED_PROFILE = {**PROFILE, "transaction_status": "acquired", "deal": DEAL}
+PENDING_PROFILE = {
+    **PROFILE,
+    "transaction_status": "pending",
+    "deal": {**DEAL, "closed_on": None},
+}
+
+
+@pytest.mark.parametrize(
+    ("step", "agent_name", "buyer_type"),
+    [
+        ("find_strategic_buyers", "strategic_agent", BuyerType.STRATEGIC),
+        ("find_sponsor_buyers", "sponsor_agent", BuyerType.FINANCIAL_SPONSOR),
+    ],
+)
+def test_buyers_are_not_sourced_for_a_target_that_is_already_acquired(
+    step: str, agent_name: str, buyer_type: BuyerType
+) -> None:
+    """Ranking bidders for a company that has already changed hands is the
+    wrong answer however good the research is — and it is the most expensive
+    step in the run. The guard is code, so the router cannot talk past it."""
+    specialist = Responder(batch(buyer_type))
+    agents: dict[str, Any] = {"profiler_agent": Responder(ACQUIRED_PROFILE), agent_name: specialist}
+
+    state = pipeline(["profile_target", step], **agents)
+
+    assert specialist.calls == 0
+    assert state.buyers_for(buyer_type) == []
+    assert len(state.errors) == 1
+    assert state.errors[0].startswith(f"{step}:")
+    assert "already acquired by Baker Hughes" in state.errors[0]
+
+
+def test_a_pending_deal_reaches_the_synthesis_prompt(deps: Deps) -> None:
+    """A signed-but-unclosed deal leaves room for a topping bid, so sourcing
+    goes ahead — but the summary has to be written knowing about it."""
+    state = state_ready_to_synthesize(
+        strategic=[candidate(f"Strategic {i}", BuyerType.STRATEGIC) for i in range(3)],
+        sponsors=[candidate(f"Sponsor {i}", BuyerType.FINANCIAL_SPONSOR) for i in range(2)],
+        profile=PENDING_PROFILE,
+    )
+    synthesis = PromptCapturingResponder(SUMMARY_ONLY)
+
+    with supervisor.synthesis_agent.override(model=FunctionModel(synthesis)):
+        asyncio.run(supervisor.dispatch(state, deps, NextStep.SYNTHESIZE))
+
+    assert '"transaction_status": "pending"' in synthesis.prompts[0]
+    assert "Baker Hughes" in synthesis.prompts[0]
