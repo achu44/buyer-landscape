@@ -45,6 +45,36 @@ claude mcp list   # verify
 Or skip MCP and just point Claude Code at https://ai.pydantic.dev/llms.txt
 (already referenced in CLAUDE.md).
 
+## Viewing past runs
+
+Every run leaves two kinds of history, both gitignored:
+
+- **`runs/<run_id>.json`** — the run's final state: steps taken, errors,
+  profile, buyer lists, landscape, `started_at` / `finished_at`. Written for
+  every run, including one that fails before reaching the CRM. Override the
+  directory with `RUNS_DIR`.
+- **`crm.db`** — the mock CRM: one `accounts` row per completed run (dated by
+  `created_at`), one `opportunities` row per buyer, and `notes` holding each
+  buyer's rationale and the landscape summary. Override with `CRM_DB_PATH`.
+
+```bash
+# Every run, newest first: when, how it ended, how many errors
+for f in $(ls -t runs/*.json); do
+  jq -r '[.run_id, .started_at, (.steps_taken | last // "none"), (.errors | length)] | @tsv' "$f"
+done
+
+# One run's route and errors
+jq '{steps_taken, errors, started_at, finished_at}' runs/<run_id>.json
+
+# One run's ranked buyers
+jq -r '.landscape | (.strategic_buyers + .sponsor_buyers)[] | [.buyer_type, .fit_score, .confidence, .name] | @tsv' runs/<run_id>.json
+
+# CRM: completed runs, then one run's opportunities and summary
+sqlite3 -column -header crm.db "SELECT run_id, name, created_at FROM accounts ORDER BY id DESC"
+sqlite3 -column -header crm.db "SELECT buyer_name, buyer_type, fit_score, stage FROM opportunities WHERE run_id='<run_id>' ORDER BY fit_score DESC"
+sqlite3 crm.db "SELECT body FROM notes WHERE parent_type='account' AND run_id='<run_id>'"
+```
+
 ## Layout
 
 ```

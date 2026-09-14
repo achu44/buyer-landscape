@@ -8,6 +8,7 @@ tool: writing an already-synthesized landscape involves no LLM judgment
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
 import logging
 import sqlite3
@@ -35,7 +36,8 @@ CREATE TABLE IF NOT EXISTS accounts (
     is_public INTEGER NOT NULL,
     est_revenue_band TEXT NOT NULL,
     description TEXT NOT NULL,
-    geographies TEXT NOT NULL
+    geographies TEXT NOT NULL,
+    created_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS opportunities (
@@ -60,16 +62,27 @@ CREATE TABLE IF NOT EXISTS notes (
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """Create the accounts/opportunities/notes tables if they don't exist."""
+    """Create the accounts/opportunities/notes tables if they don't exist, and
+    bring an older database up to the current columns.
+
+    `CREATE TABLE IF NOT EXISTS` leaves an existing table as it was, so a CRM
+    file written before accounts were dated would reject every new insert.
+    Adding the column in place keeps that file's history readable; its older
+    accounts simply read as undated. Nullable for the same reason.
+    """
     conn.executescript(_SCHEMA)
+    account_columns = {row[1] for row in conn.execute("PRAGMA table_info(accounts)")}
+    if "created_at" not in account_columns:
+        conn.execute("ALTER TABLE accounts ADD COLUMN created_at TEXT")
 
 
 def _insert_account(conn: sqlite3.Connection, target: TargetProfile, run_id: str) -> int:
     cursor = conn.execute(
         """
         INSERT INTO accounts
-            (run_id, name, sector, subsector, is_public, est_revenue_band, description, geographies)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (run_id, name, sector, subsector, is_public, est_revenue_band, description,
+             geographies, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             run_id,
@@ -80,6 +93,7 @@ def _insert_account(conn: sqlite3.Connection, target: TargetProfile, run_id: str
             target.est_revenue_band,
             target.description,
             json.dumps(target.geographies),
+            datetime.now(UTC).isoformat(),
         ),
     )
     return cursor.lastrowid
