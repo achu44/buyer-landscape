@@ -12,7 +12,12 @@ import logging
 import pytest
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent, ModelResponse, ToolCallPart
-from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.exceptions import (
+    IncompleteToolCall,
+    ModelAPIError,
+    ModelHTTPError,
+    UnexpectedModelBehavior,
+)
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.settings import ModelSettings
@@ -52,7 +57,9 @@ class FailingThenAnswering:
         return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {"verdict": "ok"})])
 
 
-def agent_answering_with(respond: FailingThenAnswering | ProviderDown) -> Agent[None, Answer]:
+def agent_answering_with(
+    respond: "FailingThenAnswering | ProviderDown | CutOffAtTheTokenLimit",
+) -> Agent[None, Answer]:
     return Agent(FunctionModel(respond), output_type=Answer, name="test_agent")
 
 
@@ -142,3 +149,60 @@ def test_the_provider_sdk_does_not_retry_underneath_the_policy(
     model = llm.build_model()
 
     assert model.client.max_retries == 0
+
+
+# ---------------------------------------------------------------------------
+# Output budget: an answer cut off at the token limit is not a wrong answer
+# ---------------------------------------------------------------------------
+
+def test_the_model_carries_an_explicit_output_budget_and_prompt_caching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Left unset, the provider default caps an answer at 4096 tokens — too
+    small for a full buyer batch. Caching is on because a research run resends
+    its whole growing tool history on every request."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    settings = dict(llm.build_model().settings or {})
+
+    assert settings["max_tokens"] == llm.MAX_OUTPUT_TOKENS
+    assert settings["anthropic_cache"] is True
+
+
+class CutOffAtTheTokenLimit:
+    """A FunctionModel function whose every answer stops on the token limit,
+    counting requests so a test can tell one request from a retried run."""
+
+    def __init__(self, payload: dict[str, str]):
+        self.payload = payload
+        self.calls = 0
+
+    def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        self.calls += 1
+        return ModelResponse(
+            parts=[ToolCallPart(info.output_tools[0].name, self.payload)],
+            finish_reason="length",
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({}, id="cut-off-answer-fails-validation"),
+        pytest.param({"verdict": "ok"}, id="cut-off-answer-still-validates"),
+    ],
+)
+def test_an_answer_cut_off_at_the_token_limit_fails_the_run_at_once(
+    payload: dict[str, str],
+) -> None:
+    """Asking again cannot help: the same limit cuts the same answer off. So
+    the run stops on the first cut-off response — no output retries, no
+    external-call retries — with an error naming the limit. That includes an
+    answer the partial JSON still happens to validate, which would otherwise
+    pass silently with buyers missing."""
+    respond = CutOffAtTheTokenLimit(payload)
+
+    with pytest.raises(IncompleteToolCall, match="token limit"):
+        asyncio.run(llm.run_agent(agent_answering_with(respond), "q", run_id=RUN_ID))
+
+    assert respond.calls == 1

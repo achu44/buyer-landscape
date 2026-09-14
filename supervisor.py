@@ -15,7 +15,8 @@ import logging
 import uuid
 
 from pydantic import TypeAdapter
-from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai import Agent, ModelRetry, RunContext, Tool
+from pydantic_ai.tools import ToolDefinition
 
 from deps import Deps, build_deps
 from llm import build_model, run_agent
@@ -44,15 +45,39 @@ log = logging.getLogger("supervisor")
 
 MAX_ITERATIONS = 12       # hard cap: the loop can never run away
 MAX_DEEPEN_ROUNDS = 2     # low-confidence re-research is bounded
+RESEARCH_TOOL_CALL_BUDGET = 20  # research tool calls per agent run
 
 MODEL = build_model()  # model choice and its retry/timeout policy live in llm.py
+
+
+async def within_research_budget(
+    ctx: RunContext[Deps], tool_def: ToolDefinition
+) -> ToolDefinition | None:
+    """Offer a research tool only while the run has budget left.
+
+    Every model request resends the whole tool history, so an agent that
+    researches until it feels done pays for its growing context again on every
+    call — the first live run's strategic step made 73 calls and read 1.46M
+    input tokens before answering. Past the budget the tools are withdrawn and
+    the model has to answer with the evidence it has: a thinner result rather
+    than a failed step. Checked before each request, so a response issuing
+    several calls at once can overshoot by that one batch.
+    """
+    if ctx.usage.tool_calls >= RESEARCH_TOOL_CALL_BUDGET:
+        return None
+    return tool_def
+
 
 # Every research agent gets the same three tools: the specialists and the
 # profiler ask the same kinds of question (who filed what, what was reported,
 # what does it trade at) and differ only in what they do with the answers.
 # Plain functions attached here rather than `@agent.tool` decorators, so one
 # tool serves all three agents — docs/adr/0002-shared-deps-for-tool-resources.md.
-RESEARCH_TOOLS = [edgar_search, web_search, comps_lookup]
+RESEARCH_TOOLS = [
+    Tool(edgar_search, prepare=within_research_budget),
+    Tool(web_search, prepare=within_research_budget),
+    Tool(comps_lookup, prepare=within_research_budget),
+]
 
 # ---------------------------------------------------------------------------
 # Agents. Each declares its output schema; Pydantic AI validates the model's
