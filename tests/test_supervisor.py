@@ -29,7 +29,7 @@ import supervisor
 from tests.fakes import MODEL_NAME, ProviderDown
 from tools import web
 from deps import Deps, build_deps
-from schemas import BuyerLandscape, BuyerType, NextStep, RunState
+from schemas import MIN_LANDSCAPE_BUYERS, BuyerLandscape, BuyerType, NextStep, RunState
 
 RUN_ID = "run-test01"
 
@@ -65,12 +65,12 @@ PROFILE = {
 
 
 def candidate(
-    name: str, buyer_type: BuyerType, confidence: str = "high"
+    name: str, buyer_type: BuyerType, confidence: str = "high", fit_score: int = 80
 ) -> dict[str, Any]:
     return {
         "name": name,
         "buyer_type": buyer_type.value,
-        "fit_score": 80,
+        "fit_score": fit_score,
         "rationale": RATIONALE,
         "signals": ["Acquired Cryo Components in 2023"],
         "confidence": confidence,
@@ -562,6 +562,9 @@ SUMMARY = (
 )
 
 
+SUMMARY_ONLY = {"summary": SUMMARY}  # all the synthesis model now hands back
+
+
 def landscape_payload() -> dict[str, Any]:
     """A five-buyer landscape as the synthesis model would hand it back."""
     return {
@@ -726,7 +729,7 @@ def test_a_full_run_profiles_sources_deepens_synthesizes_and_writes_the_crm(
     sponsor_deepen = Responder(
         deepened(BuyerType.FINANCIAL_SPONSOR, confirms("Apollo", BuyerType.FINANCIAL_SPONSOR))
     )
-    synthesis = PromptCapturingResponder(landscape_payload())
+    synthesis = PromptCapturingResponder(SUMMARY_ONLY)
     steps = [
         "profile_target",
         "find_strategic_buyers",
@@ -775,6 +778,12 @@ def test_a_full_run_profiles_sources_deepens_synthesizes_and_writes_the_crm(
     assert "Ghost Industrial" not in synthesis.prompts[0]
 
     assert state.landscape is not None
+    # The landscape is the deepened lists themselves; all fit scores tie, so
+    # each keeps its sourced order.
+    assert [b.name for b in state.landscape.strategic_buyers] == [
+        "Air Liquide", "Linde", "Air Products"
+    ]
+    assert [b.name for b in state.landscape.sponsor_buyers] == ["Apollo", "KKR"]
     assert state.crm_written is True
     assert crm_rows(crm_db, "SELECT name, run_id FROM accounts") == [
         ("Chart Industries", state.run_id)
@@ -832,9 +841,22 @@ def test_a_step_that_raises_is_recorded_and_the_run_goes_on(
         ],
         crm_db,
         profiler_agent=Responder(PROFILE),
-        strategic_agent=Responder(batch(BuyerType.STRATEGIC, "Air Liquide")),
-        sponsor_agent=Responder(batch(BuyerType.FINANCIAL_SPONSOR, "Apollo")),
-        synthesis_agent=Responder(landscape_payload()),
+        strategic_agent=Responder(
+            batch_of(
+                BuyerType.STRATEGIC,
+                candidate("Air Liquide", BuyerType.STRATEGIC),
+                candidate("Linde", BuyerType.STRATEGIC),
+                candidate("Air Products", BuyerType.STRATEGIC),
+            )
+        ),
+        sponsor_agent=Responder(
+            batch_of(
+                BuyerType.FINANCIAL_SPONSOR,
+                candidate("Apollo", BuyerType.FINANCIAL_SPONSOR),
+                candidate("KKR", BuyerType.FINANCIAL_SPONSOR),
+            )
+        ),
+        synthesis_agent=Responder(SUMMARY_ONLY),
     )
 
     assert state.errors == ["write_to_crm: database is locked"]
@@ -866,9 +888,17 @@ def test_the_deepen_round_cap_holds_across_a_full_run(crm_db: Path) -> None:
         strategic_agent=Responder(
             batch_of(BuyerType.STRATEGIC, candidate("Air Liquide", BuyerType.STRATEGIC, "low"))
         ),
-        sponsor_agent=Responder(batch(BuyerType.FINANCIAL_SPONSOR, "Apollo")),
+        sponsor_agent=Responder(
+            batch_of(
+                BuyerType.FINANCIAL_SPONSOR,
+                *(
+                    candidate(name, BuyerType.FINANCIAL_SPONSOR)
+                    for name in ("Apollo", "KKR", "Blackstone", "Carlyle")
+                ),
+            )
+        ),
         strategic_deepen_agent=deepen,
-        synthesis_agent=Responder(landscape_payload()),
+        synthesis_agent=Responder(SUMMARY_ONLY),
     )
 
     assert deepen.calls == supervisor.MAX_DEEPEN_ROUNDS
@@ -935,3 +965,99 @@ def test_research_tools_are_withdrawn_once_the_budget_is_spent(
     assert respond.offered == [RESEARCH_TOOL_NAMES] * 3 + [[]]
     assert len(searches) == 3
     assert result.output is not None
+
+
+# ---------------------------------------------------------------------------
+# Synthesis: the model writes the summary; the landscape comes from run state
+# ---------------------------------------------------------------------------
+
+def state_ready_to_synthesize(
+    strategic: list[dict[str, Any]],
+    sponsors: list[dict[str, Any]],
+    profile: dict[str, Any] | None = PROFILE,
+) -> RunState:
+    return RunState.model_validate(
+        {
+            "run_id": RUN_ID,
+            "target_input": "Chart Industries",
+            "profile": profile,
+            "strategic_buyers": strategic,
+            "sponsor_buyers": sponsors,
+        }
+    )
+
+
+def test_synthesis_assembles_the_landscape_from_run_state_ranked_by_fit_score(
+    deps: Deps,
+) -> None:
+    """The model hands back a summary and nothing else, so it cannot drop,
+    rename or invent a buyer, and the step no longer re-types every candidate
+    just to put them in order. Ranking is the rule the prompt always stated —
+    fit_score, highest first — applied in code; ties keep sourced order."""
+    state = state_ready_to_synthesize(
+        strategic=[
+            candidate("Linde", BuyerType.STRATEGIC, fit_score=70),
+            candidate("Air Liquide", BuyerType.STRATEGIC, fit_score=90),
+            candidate("Air Products", BuyerType.STRATEGIC, fit_score=70),
+        ],
+        sponsors=[
+            candidate("KKR", BuyerType.FINANCIAL_SPONSOR, fit_score=60),
+            candidate("Apollo", BuyerType.FINANCIAL_SPONSOR, fit_score=85),
+        ],
+    )
+    synthesis = PromptCapturingResponder(SUMMARY_ONLY)
+
+    with supervisor.synthesis_agent.override(model=FunctionModel(synthesis)):
+        asyncio.run(supervisor.dispatch(state, deps, NextStep.SYNTHESIZE))
+
+    landscape = state.landscape
+    assert landscape is not None
+    assert [b.name for b in landscape.strategic_buyers] == ["Air Liquide", "Linde", "Air Products"]
+    assert [b.name for b in landscape.sponsor_buyers] == ["Apollo", "KKR"]
+    assert landscape.summary == SUMMARY
+    assert landscape.target == state.profile
+    # The summary is written against the ranking the landscape will carry.
+    prompt = synthesis.prompts[0]
+    assert prompt.index("Air Liquide") < prompt.index("Linde") < prompt.index("Air Products")
+
+
+def test_synthesis_without_a_profile_fails_before_calling_the_model(deps: Deps) -> None:
+    state = state_ready_to_synthesize(
+        strategic=[candidate(f"Strategic {i}", BuyerType.STRATEGIC) for i in range(3)],
+        sponsors=[candidate(f"Sponsor {i}", BuyerType.FINANCIAL_SPONSOR) for i in range(2)],
+        profile=None,
+    )
+    synthesis = Responder(SUMMARY_ONLY)
+
+    with supervisor.synthesis_agent.override(model=FunctionModel(synthesis)):
+        with pytest.raises(RuntimeError, match="no profile"):
+            asyncio.run(supervisor.dispatch(state, deps, NextStep.SYNTHESIZE))
+
+    assert synthesis.calls == 0
+    assert state.landscape is None
+
+
+def test_a_run_too_thin_for_a_landscape_skips_the_model_and_records_why() -> None:
+    """One buyer short of the minimum: the landscape could never validate, so
+    the step fails before spending a model call, and the router is told why."""
+    strategic_count = MIN_LANDSCAPE_BUYERS - 2
+    synthesis = Responder(SUMMARY_ONLY)
+
+    state = pipeline(
+        ["profile_target", "find_strategic_buyers", "find_sponsor_buyers", "synthesize"],
+        profiler_agent=Responder(PROFILE),
+        strategic_agent=Responder(
+            batch_of(
+                BuyerType.STRATEGIC,
+                *(candidate(f"Strategic {i}", BuyerType.STRATEGIC) for i in range(strategic_count)),
+            )
+        ),
+        sponsor_agent=Responder(batch(BuyerType.FINANCIAL_SPONSOR, "Apollo")),
+        synthesis_agent=synthesis,
+    )
+
+    assert synthesis.calls == 0
+    assert state.landscape is None
+    assert len(state.errors) == 1
+    assert state.errors[0].startswith("synthesize:")
+    assert f"{MIN_LANDSCAPE_BUYERS - 1} buyers" in state.errors[0]

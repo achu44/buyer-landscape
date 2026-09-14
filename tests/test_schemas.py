@@ -6,8 +6,10 @@ import pytest
 from pydantic import ValidationError
 
 from schemas import (
+    MIN_LANDSCAPE_BUYERS,
     BuyerCandidate,
     BuyerCandidateBatch,
+    BuyerLandscape,
     BuyerType,
     Confidence,
     DeepenedBatch,
@@ -247,3 +249,44 @@ def test_confirmation_keeps_the_name_the_buyer_was_sourced_under():
 
     assert [b.name for b in state.strategic_buyers] == ["Air Liquide"]
     assert state.strategic_buyers[0].confidence is Confidence.HIGH
+
+
+PROFILE = {
+    "name": "Chart Industries",
+    "description": (
+        "Chart Industries engineers and manufactures cryogenic equipment used "
+        "to liquefy, store and transport industrial gases, LNG and hydrogen."
+    ),
+    "sector": "Industrials",
+    "subsector": "Cryogenic equipment",
+    "is_public": True,
+    "est_revenue_band": "$1B-$5B",
+    "key_assets": ["Cryogenic tank manufacturing footprint"],
+    "geographies": ["United States"],
+    "sources": ["https://example.com/10-K"],
+}
+
+SUMMARY = (
+    "Chart Industries draws interest from both strategic acquirers and financial "
+    "sponsors. Industrial-gas majors see a direct adjacency in cryogenic storage "
+    "and transport, while sponsors view it as a hydrogen infrastructure platform."
+)
+
+
+@pytest.mark.parametrize("buyer_count", [MIN_LANDSCAPE_BUYERS - 1, MIN_LANDSCAPE_BUYERS])
+def test_landscape_needs_the_minimum_number_of_buyers(buyer_count: int):
+    """The supervisor checks the same constant before spending a synthesis
+    call, so one definition decides both."""
+    strategic = [make_candidate(f"Strategic {i}") for i in range(buyer_count - 1)]
+    sponsors = [make_candidate("Sponsor", BuyerType.FINANCIAL_SPONSOR)]
+
+    def build() -> BuyerLandscape:
+        return BuyerLandscape.model_validate(
+            {"target": PROFILE, "strategic_buyers": strategic, "sponsor_buyers": sponsors, "summary": SUMMARY}
+        )
+
+    if buyer_count < MIN_LANDSCAPE_BUYERS:
+        with pytest.raises(ValidationError, match="too thin"):
+            build()
+    else:
+        assert len(build().strategic_buyers) == buyer_count - 1

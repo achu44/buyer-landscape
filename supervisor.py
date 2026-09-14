@@ -21,11 +21,13 @@ from pydantic_ai.tools import ToolDefinition
 from deps import Deps, build_deps
 from llm import build_model, run_agent
 from schemas import (
+    MIN_LANDSCAPE_BUYERS,
     BuyerCandidate,
     BuyerCandidateBatch,
     BuyerLandscape,
     BuyerType,
     DeepenedBatch,
+    LandscapeSummary,
     NextStep,
     RouterDecision,
     RunState,
@@ -122,11 +124,13 @@ profiler_agent = Agent(
 synthesis_agent = Agent(
     MODEL,
     name="synthesis",
-    output_type=BuyerLandscape,
+    output_type=LandscapeSummary,
     instructions=(
-        "Assemble the final buyer landscape from the profile and candidate "
-        "lists provided. Rank by fit_score. Write a banker-readable summary. "
-        "Do not invent buyers not present in the inputs."
+        "Write the banker-readable summary of a buyer landscape. You are given "
+        "the target's profile and both buyer lists, already ranked by fit_score. "
+        "Summarize who the most credible buyers are and why, across strategic "
+        "acquirers and financial sponsors, drawing only on the rationale and "
+        "signals provided. Refer only to buyers in the lists."
     ),
     retries=2,
 )
@@ -419,6 +423,59 @@ async def _deepen_research(state: RunState, deps: Deps) -> None:
             state.errors.append(f"deepen_research ({buyer_type.value}): {exc}")
 
 
+def _ranked(buyers: list[BuyerCandidate]) -> list[BuyerCandidate]:
+    """Highest fit first. `sorted` is stable, so buyers that tie keep the order
+    they were sourced in."""
+    return sorted(buyers, key=lambda buyer: buyer.fit_score, reverse=True)
+
+
+def _synthesis_prompt(
+    profile: TargetProfile, strategic: list[BuyerCandidate], sponsors: list[BuyerCandidate]
+) -> str:
+    """The buyers go in already ranked, so the summary is written against the
+    order the landscape will carry."""
+    return (
+        f"PROFILE:\n{profile.model_dump_json(indent=2)}\n\n"
+        f"STRATEGIC BUYERS (ranked):\n{_CANDIDATE_LIST_JSON.dump_json(strategic, indent=2).decode()}\n\n"
+        f"FINANCIAL SPONSORS (ranked):\n{_CANDIDATE_LIST_JSON.dump_json(sponsors, indent=2).decode()}"
+    )
+
+
+async def _synthesize(state: RunState) -> None:
+    """Assemble the landscape from run state, with the model writing only its
+    summary — docs/adr/0005-synthesis-writes-only-the-summary.md.
+
+    Everything but the summary already exists and has been validated by the
+    time synthesis is routed to, so the model never re-types a buyer: it
+    cannot drop, rename or invent one, and the step's output stays small
+    enough to finish inside the request timeout. The guardrails come first so
+    a state that could never become a landscape costs no model call.
+    """
+    if state.profile is None:
+        raise RuntimeError("no profile yet; profile the target before synthesizing")
+
+    buyer_count = len(state.strategic_buyers) + len(state.sponsor_buyers)
+    if buyer_count < MIN_LANDSCAPE_BUYERS:
+        raise RuntimeError(
+            f"only {buyer_count} buyers across both lists; a landscape needs at least "
+            f"{MIN_LANDSCAPE_BUYERS}, so source more buyers before synthesizing"
+        )
+
+    strategic = _ranked(state.strategic_buyers)
+    sponsors = _ranked(state.sponsor_buyers)
+    written = await run_agent(
+        synthesis_agent,
+        _synthesis_prompt(state.profile, strategic, sponsors),
+        run_id=state.run_id,
+    )
+    state.landscape = BuyerLandscape(
+        target=state.profile,
+        strategic_buyers=strategic,
+        sponsor_buyers=sponsors,
+        summary=written.summary,
+    )
+
+
 async def _write_landscape_to_crm(state: RunState, deps: Deps) -> None:
     """Persist the run's finished landscape to the mock CRM.
 
@@ -464,12 +521,7 @@ async def dispatch(state: RunState, deps: Deps, step: NextStep) -> None:
         await _deepen_research(state, deps)
 
     elif step == NextStep.SYNTHESIZE:
-        prompt = (
-            f"PROFILE:\n{state.profile.model_dump_json() if state.profile else 'MISSING'}\n\n"
-            f"STRATEGIC:\n{[b.model_dump() for b in state.strategic_buyers]}\n\n"
-            f"SPONSORS:\n{[b.model_dump() for b in state.sponsor_buyers]}"
-        )
-        state.landscape = await run_agent(synthesis_agent, prompt, run_id=state.run_id)
+        await _synthesize(state)
 
     elif step == NextStep.WRITE_TO_CRM:
         await _write_landscape_to_crm(state, deps)

@@ -200,8 +200,23 @@ class DeepenedBatch(BaseModel):
         return self
 
 
+# A landscape thinner than this is not worth handing a banker. Shared by
+# `BuyerLandscape`'s validator and the supervisor's check before synthesis, so
+# the step never spends a model call on a state that could not validate.
+MIN_LANDSCAPE_BUYERS = 5
+
+
+class LandscapeSummary(BaseModel):
+    """Output of the synthesis agent: the one part of a landscape the run does
+    not already hold. The profile and ranked buyers come from `RunState`
+    (docs/adr/0005-synthesis-writes-only-the-summary.md)."""
+
+    summary: str = Field(min_length=200, description="Banker-readable overview of the landscape")
+
+
 class BuyerLandscape(BaseModel):
-    """Output of the synthesis agent — the final deliverable."""
+    """The final deliverable, assembled by the supervisor from run state and
+    the synthesis agent's summary."""
 
     target: TargetProfile
     strategic_buyers: list[BuyerCandidate]
@@ -211,8 +226,11 @@ class BuyerLandscape(BaseModel):
 
     @model_validator(mode="after")
     def check_coverage_and_types(self) -> "BuyerLandscape":
-        if len(self.strategic_buyers) + len(self.sponsor_buyers) < 5:
-            raise ValueError("Landscape too thin: need at least 5 buyers total. Add more candidates.")
+        if len(self.strategic_buyers) + len(self.sponsor_buyers) < MIN_LANDSCAPE_BUYERS:
+            raise ValueError(
+                f"Landscape too thin: need at least {MIN_LANDSCAPE_BUYERS} buyers total. "
+                "Add more candidates."
+            )
         for b in self.strategic_buyers:
             if b.buyer_type != BuyerType.STRATEGIC:
                 raise ValueError(f"{b.name} is in strategic_buyers but typed {b.buyer_type}")
