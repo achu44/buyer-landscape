@@ -139,6 +139,10 @@ synthesis_agent = Agent(
         "Summarize who the most credible buyers are and why, across strategic "
         "acquirers and financial sponsors, drawing only on the rationale and "
         "signals provided. Refer only to buyers in the lists.\n"
+        "Keep it to about 300-400 words: the shape of the landscape, the "
+        "strongest buyers on each side and what sets them apart, and the main "
+        "risks. Do not write a section per buyer — each buyer's full rationale "
+        "is already stored on its own CRM record.\n"
         "If the profile's transaction_status is pending, open the summary with "
         "that deal — the acquirer and where it stands — before the buyer analysis."
     ),

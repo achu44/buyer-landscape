@@ -29,7 +29,14 @@ import supervisor
 from tests.fakes import MODEL_NAME, ProviderDown
 from tools import web
 from deps import Deps, build_deps
-from schemas import MIN_LANDSCAPE_BUYERS, BuyerLandscape, BuyerType, NextStep, RunState
+from schemas import (
+    MIN_LANDSCAPE_BUYERS,
+    SUMMARY_MAX_CHARS,
+    BuyerLandscape,
+    BuyerType,
+    NextStep,
+    RunState,
+)
 
 RUN_ID = "run-test01"
 
@@ -1214,3 +1221,27 @@ def test_a_pending_deal_reaches_the_synthesis_prompt(deps: Deps) -> None:
 
     assert '"transaction_status": "pending"' in synthesis.prompts[0]
     assert "Baker Hughes" in synthesis.prompts[0]
+
+
+
+# ---------------------------------------------------------------------------
+# Summary length: an overview, not a per-buyer essay
+# ---------------------------------------------------------------------------
+
+def test_an_over_long_summary_is_sent_back_for_a_shorter_one(deps: Deps) -> None:
+    """Live run 01100708 wrote a 2,334-word summary in 91 of the request's 120
+    seconds. An answer past the cap is returned to the model as a validation
+    error and rewritten, rather than stored or left to time out next time."""
+    state = state_ready_to_synthesize(
+        strategic=[candidate(f"Strategic {i}", BuyerType.STRATEGIC) for i in range(3)],
+        sponsors=[candidate(f"Sponsor {i}", BuyerType.FINANCIAL_SPONSOR) for i in range(2)],
+    )
+    essay = {"summary": SUMMARY * (SUMMARY_MAX_CHARS // len(SUMMARY) + 1)}
+    synthesis = Responder(essay, SUMMARY_ONLY)
+
+    with supervisor.synthesis_agent.override(model=FunctionModel(synthesis)):
+        asyncio.run(supervisor.dispatch(state, deps, NextStep.SYNTHESIZE))
+
+    assert synthesis.calls == 2
+    assert state.landscape is not None
+    assert state.landscape.summary == SUMMARY
