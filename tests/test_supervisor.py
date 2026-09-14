@@ -17,6 +17,7 @@ import sqlite3
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 from pydantic_ai import ModelResponse, ToolCallPart
 from pydantic_ai.exceptions import ModelHTTPError
@@ -26,6 +27,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 import deps as deps_module
 import supervisor
 from tests.fakes import MODEL_NAME, ProviderDown
+from tools import web
 from deps import Deps, build_deps
 from schemas import BuyerLandscape, BuyerType, NextStep, RunState
 
@@ -875,3 +877,61 @@ def test_the_deepen_round_cap_holds_across_a_full_run(crm_db: Path) -> None:
     assert "past the round cap" in state.errors[0]
     assert state.low_confidence_count() == 1
     assert state.crm_written is True
+
+
+# ---------------------------------------------------------------------------
+# Research budget: a bounded number of tool calls per agent run
+# ---------------------------------------------------------------------------
+
+class ResearchingResponder(Responder):
+    """A model that searches the web on every request it is offered research
+    tools, and answers only once they are gone — the agent that never stops
+    researching on its own, recording what it was offered each time."""
+
+    def __init__(self, *payloads: dict[str, Any]):
+        super().__init__(*payloads)
+        self.offered: list[list[str]] = []
+
+    def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_names = sorted(tool.name for tool in info.function_tools)
+        self.offered.append(tool_names)
+        if tool_names:
+            return ModelResponse(
+                parts=[ToolCallPart("web_search", {"query": "cryogenic equipment acquirers"})]
+            )
+        return super().__call__(messages, info)
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "payload"),
+    [
+        ("profiler_agent", PROFILE),
+        ("strategic_agent", batch(BuyerType.STRATEGIC)),
+        ("strategic_deepen_agent", deepened(BuyerType.STRATEGIC, refutes("Acme Corp"))),
+    ],
+)
+def test_research_tools_are_withdrawn_once_the_budget_is_spent(
+    agent_name: str, payload: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every request resends the whole tool history, so an agent left to
+    research until it feels done pays for its context again on every call.
+    Past the budget the tools go away and the model must answer with the
+    evidence it has — a thinner result, not a failed step."""
+    monkeypatch.setattr(supervisor, "RESEARCH_TOOL_CALL_BUDGET", 3)
+    monkeypatch.setenv(web.API_KEY_ENV, "test-subscription-token")
+    searches: list[httpx.Request] = []
+
+    def brave(request: httpx.Request) -> httpx.Response:
+        searches.append(request)
+        return httpx.Response(200, json={})  # Brave omits `web` when nothing matched
+
+    research_deps = build_deps(RUN_ID, transport=httpx.MockTransport(brave))
+    respond = ResearchingResponder(payload)
+    agent = getattr(supervisor, agent_name)
+
+    with agent.override(model=FunctionModel(respond)):
+        result = agent.run_sync("Research the target", deps=research_deps)
+
+    assert respond.offered == [RESEARCH_TOOL_NAMES] * 3 + [[]]
+    assert len(searches) == 3
+    assert result.output is not None

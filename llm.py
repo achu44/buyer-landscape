@@ -16,13 +16,17 @@ one layer every model — including the FunctionModel the tests use — shares;
 the research tools are read-only, so a repeat costs time, not correctness.
 """
 
+from dataclasses import dataclass
 from http import HTTPStatus
 import logging
+from typing import Any
 
 from anthropic import AsyncAnthropic
-from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
-from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai import Agent, ModelResponse, RunContext
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.exceptions import IncompleteToolCall, ModelAPIError, ModelHTTPError
+from pydantic_ai.models import ModelRequestContext
+from pydantic_ai.models.anthropic import AnthropicModel, AnthropicModelSettings
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from tenacity import AsyncRetrying
 
@@ -36,6 +40,13 @@ MODEL_NAME = "claude-sonnet-4-6"  # pick per docs; cheap+fast is fine here
 # with tool calls in between, and only a single hung request is worth cutting
 # off. Generous because a long structured answer legitimately takes a while.
 LLM_REQUEST_TIMEOUT_SECONDS = 120.0
+
+# Per model response. Left unset, Pydantic AI asks Anthropic for 4096 tokens,
+# and a full buyer batch — several candidates, each with a 150-character-plus
+# rationale, signals and sources — does not fit: the first live run lost its
+# strategic list to exactly that. Sized for the largest structured answer in
+# the pipeline, the synthesized landscape.
+MAX_OUTPUT_TOKENS = 16_000
 
 # Rate limiting (429) and the provider being unwell (5xx, Anthropic's 529
 # overloaded included) clear on their own. Every other status is about the
@@ -57,7 +68,43 @@ def build_model() -> AnthropicModel:
     overridden, where no key exists.
     """
     client = AsyncAnthropic(max_retries=0)
-    return AnthropicModel(MODEL_NAME, provider=AnthropicProvider(anthropic_client=client))
+    settings = AnthropicModelSettings(
+        max_tokens=MAX_OUTPUT_TOKENS,
+        # A research run resends its whole growing tool history on every
+        # request; caching bills that repeated prefix at the cache-read rate.
+        anthropic_cache=True,
+    )
+    return AnthropicModel(
+        MODEL_NAME, provider=AnthropicProvider(anthropic_client=client), settings=settings
+    )
+
+
+@dataclass
+class StopOnTruncatedResponse(AbstractCapability[Any]):
+    """Fail the run the moment a response is cut off at the token limit.
+
+    Pydantic AI raises `IncompleteToolCall` only when the truncated arguments
+    are invalid JSON, but the Anthropic SDK hands back partial tool input as a
+    valid dict. A cut-off answer then surfaces as a validation error, and the
+    agent spends its output retries re-asking for an answer the same limit
+    will cut off again — or, when the partial JSON happens to validate, passes
+    silently with the tail of the answer missing. Checked on the response
+    itself, before any parsing, so neither can happen.
+    """
+
+    async def after_model_request(
+        self,
+        ctx: RunContext[Any],
+        *,
+        request_context: ModelRequestContext,
+        response: ModelResponse,
+    ) -> ModelResponse:
+        if response.finish_reason == "length":
+            raise IncompleteToolCall(
+                f"Model response was cut off at the token limit (max_tokens={MAX_OUTPUT_TOKENS}); "
+                "retrying cannot fix it. Raise MAX_OUTPUT_TOKENS or ask for a shorter answer."
+            )
+        return response
 
 
 def is_transient_model_error(exc: BaseException) -> bool:
@@ -98,6 +145,9 @@ async def run_agent[DepsT, OutputT](
                 prompt,
                 deps=deps,
                 model_settings={"timeout": LLM_REQUEST_TIMEOUT_SECONDS},
+                # Attached per run rather than per agent, so no agent built
+                # anywhere can be run without it.
+                capabilities=[StopOnTruncatedResponse()],
             )
             log.info(
                 "agent run completed: run_id=%s agent=%s attempts=%d",
