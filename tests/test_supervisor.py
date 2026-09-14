@@ -1061,3 +1061,95 @@ def test_a_run_too_thin_for_a_landscape_skips_the_model_and_records_why() -> Non
     assert len(state.errors) == 1
     assert state.errors[0].startswith("synthesize:")
     assert f"{MIN_LANDSCAPE_BUYERS - 1} buyers" in state.errors[0]
+
+
+# ---------------------------------------------------------------------------
+# Run history: every run leaves a record of how it went
+# ---------------------------------------------------------------------------
+
+def read_record(runs_dir: Path, state: RunState) -> RunState:
+    return RunState.model_validate_json((runs_dir / f"{state.run_id}.json").read_text())
+
+
+def test_a_finished_run_leaves_a_record_of_how_it_went(crm_db: Path, runs_dir: Path) -> None:
+    """The CRM holds what a run found; the record holds how it got there —
+    steps, errors and timing — which nothing else keeps once the terminal
+    scrolls away."""
+    state = pipeline(
+        [
+            "profile_target",
+            "find_strategic_buyers",
+            "find_sponsor_buyers",
+            "synthesize",
+            "write_to_crm",
+        ],
+        crm_db,
+        profiler_agent=Responder(PROFILE),
+        strategic_agent=Responder(
+            batch_of(
+                BuyerType.STRATEGIC,
+                *(candidate(name, BuyerType.STRATEGIC) for name in ("Air Liquide", "Linde", "Air Products")),
+            )
+        ),
+        sponsor_agent=Responder(
+            batch_of(
+                BuyerType.FINANCIAL_SPONSOR,
+                *(candidate(name, BuyerType.FINANCIAL_SPONSOR) for name in ("Apollo", "KKR")),
+            )
+        ),
+        synthesis_agent=Responder(SUMMARY_ONLY),
+    )
+
+    record = read_record(runs_dir, state)
+
+    assert record == state
+    assert record.landscape is not None
+    assert record.crm_written is True
+    assert record.finished_at is not None
+    assert record.started_at <= record.finished_at
+
+
+@pytest.mark.usefixtures("no_backoff")
+@pytest.mark.parametrize(
+    "router_model",
+    [
+        pytest.param(lambda: ProviderDown(503), id="router-provider-down"),
+        pytest.param(
+            lambda: Responder(
+                {"next_step": "profile_target", "reason": "The profile could always be better."}
+            ),
+            id="router-never-says-done",
+        ),
+    ],
+)
+def test_a_run_that_ends_degraded_still_leaves_a_record(
+    router_model: Any, runs_dir: Path
+) -> None:
+    """The runs most worth looking back at are the ones that went wrong."""
+    with (
+        supervisor.router_agent.override(model=FunctionModel(router_model())),
+        supervisor.profiler_agent.override(model=FunctionModel(Responder(PROFILE))),
+    ):
+        state = supervisor.run("Chart Industries — cryogenic equipment")
+
+    record = read_record(runs_dir, state)
+
+    assert record == state
+    assert record.finished_at is not None
+
+
+def test_a_record_that_cannot_be_written_is_logged_not_raised(
+    runs_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The record is a convenience for looking back; failing to write it must
+    not cost the caller the run it just paid for."""
+    runs_dir.parent.mkdir(parents=True, exist_ok=True)
+    not_a_directory = runs_dir.parent / "not-a-directory"
+    not_a_directory.write_text("")
+    monkeypatch.setattr(deps_module, "RUNS_DIR", str(not_a_directory))
+
+    with caplog.at_level(logging.ERROR, logger="supervisor"):
+        state = pipeline(["profile_target"], profiler_agent=Responder(PROFILE))
+
+    assert state.profile is not None
+    assert f"run record not written: run_id={state.run_id}" in caplog.text

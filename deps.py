@@ -14,7 +14,7 @@ retry with the same policy and log with the same run_id convention.
 """
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import os
 from typing import Any
@@ -38,6 +38,11 @@ BACKOFF_MAX = 8.0
 # Where the mock CRM's SQLite file lives. Read from the environment so a demo
 # run and a test run never share a database.
 CRM_DB_PATH = os.environ.get("CRM_DB_PATH", "crm.db")
+
+# Where each run writes its record, `<RUNS_DIR>/<run_id>.json`. Read when a
+# `Deps` is built rather than bound as a default argument, so tests can point
+# every run at a temporary directory by patching this one name.
+RUNS_DIR = os.environ.get("RUNS_DIR", "runs")
 
 
 def is_transient_error(exc: BaseException) -> bool:
@@ -144,6 +149,7 @@ class Deps:
     http_client: httpx.AsyncClient
     run_id: str
     crm_db_path: str = CRM_DB_PATH
+    runs_dir: str = field(default_factory=lambda: RUNS_DIR)
 
 
 def build_deps(
@@ -151,9 +157,11 @@ def build_deps(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     crm_db_path: str = CRM_DB_PATH,
+    runs_dir: str | None = None,
 ) -> Deps:
     return Deps(
         http_client=build_http_client(run_id, transport=transport),
         run_id=run_id,
         crm_db_path=crm_db_path,
+        runs_dir=runs_dir if runs_dir is not None else RUNS_DIR,
     )

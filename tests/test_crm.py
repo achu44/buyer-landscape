@@ -1,6 +1,7 @@
 """Unit tests for tools/crm.py — the mock CRM writer. Runs against a
 temporary on-disk SQLite database; no agent or network calls."""
 
+from datetime import UTC, datetime
 import sqlite3
 
 import pytest
@@ -205,3 +206,45 @@ def test_writing_twice_creates_two_independent_accounts(db_path):
     conn = _connect(db_path)
     assert conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0] == 10
+
+
+def test_new_accounts_record_when_they_were_created(db_path):
+    """Without a timestamp, past runs can only be ordered, never dated."""
+    before = datetime.now(UTC)
+
+    write_to_crm(make_landscape(), RUN_ID, db_path)
+
+    (row,) = _connect(db_path).execute("SELECT created_at FROM accounts").fetchall()
+    assert before <= datetime.fromisoformat(row["created_at"]) <= datetime.now(UTC)
+
+
+def test_a_database_from_before_created_at_is_upgraded_in_place(db_path):
+    """A CRM file written before accounts were dated keeps its history: the
+    column is added, old accounts read as undated, and new ones are dated."""
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            sector TEXT NOT NULL,
+            subsector TEXT NOT NULL,
+            is_public INTEGER NOT NULL,
+            est_revenue_band TEXT NOT NULL,
+            description TEXT NOT NULL,
+            geographies TEXT NOT NULL
+        );
+        INSERT INTO accounts
+            (run_id, name, sector, subsector, is_public, est_revenue_band, description, geographies)
+        VALUES ('run-old', 'Old Target', 'Industrials', 'Pumps', 0, 'unknown', 'An older run.', '[]');
+        """
+    )
+    conn.close()
+
+    write_to_crm(make_landscape(), RUN_ID, db_path)
+
+    rows = _connect(db_path).execute("SELECT run_id, created_at FROM accounts ORDER BY id").fetchall()
+    assert [row["run_id"] for row in rows] == ["run-old", RUN_ID]
+    assert rows[0]["created_at"] is None
+    assert rows[1]["created_at"] is not None

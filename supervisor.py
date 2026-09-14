@@ -11,7 +11,9 @@ closed on the same loop that the tools used it from.
 """
 
 import asyncio
+from datetime import UTC, datetime
 import logging
+from pathlib import Path
 import uuid
 
 from pydantic import TypeAdapter
@@ -527,6 +529,22 @@ async def dispatch(state: RunState, deps: Deps, step: NextStep) -> None:
         await _write_landscape_to_crm(state, deps)
 
 
+def _save_run_record(state: RunState, runs_dir: str) -> None:
+    """Write the run's final state to `<runs_dir>/<run_id>.json`.
+
+    The CRM keeps what a run found; this keeps how it got there — the steps
+    taken, the errors recorded, when it started and finished — including for
+    a run that never reached the CRM. Best-effort: the record is for looking
+    back, and failing to write it must not cost the caller the run itself.
+    """
+    try:
+        path = Path(runs_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / f"{state.run_id}.json").write_text(state.model_dump_json(indent=2))
+    except Exception:  # noqa: BLE001 — degrade, don't crash
+        log.exception("run record not written: run_id=%s runs_dir=%s", state.run_id, runs_dir)
+
+
 async def _run(target_input: str) -> RunState:
     state = RunState(run_id=uuid.uuid4().hex[:8], target_input=target_input)
     deps = build_deps(state.run_id)
@@ -567,7 +585,11 @@ async def _run(target_input: str) -> RunState:
         else:
             log.warning("hit MAX_ITERATIONS without DONE (run_id=%s)", state.run_id)
     finally:
-        await deps.http_client.aclose()
+        state.finished_at = datetime.now(UTC)
+        try:
+            await deps.http_client.aclose()
+        finally:
+            _save_run_record(state, deps.runs_dir)
 
     log.info("run finished: steps=%s errors=%d", state.steps_taken, len(state.errors))
     return state

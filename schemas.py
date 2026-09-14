@@ -5,7 +5,7 @@ Validation failures are fed back to the model for retry (Pydantic AI
 does this automatically when an output fails to validate).
 """
 
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
@@ -431,6 +431,11 @@ class RunState(BaseModel):
     deepen_rounds_used: int = 0
     steps_taken: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    # Kept on the state, not only in logs, so a run's record says when it ran
+    # and how long it took. `finished_at` is set as the loop exits, however
+    # it exits.
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    finished_at: datetime | None = None
 
     def record_buyers(
         self, buyer_type: BuyerType, candidates: list[BuyerCandidate]

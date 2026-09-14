@@ -17,3 +17,6 @@ wheels/
 
 # Mock CRM database written by pipeline runs
 *.db
+
+# Per-run records (runs/<run_id>.json) and saved run artifacts
+runs/
