@@ -7,6 +7,7 @@ does this automatically when an output fails to validate).
 
 from datetime import UTC, date, datetime
 from enum import Enum
+from typing import Annotated
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -247,6 +248,24 @@ class DeepenedBatch(BaseModel):
         return self
 
 
+# How long the banker-readable summary may be, in characters. The upper bound
+# exists because an unbounded summary grows into a per-buyer essay — live run
+# 01100708 wrote 2,334 words in 91 of the request's 120 seconds — and each
+# buyer's own rationale already lives on its CRM Opportunity note. Set well
+# above the ~400-word target the synthesis prompt asks for, so a compliant
+# answer never trips it. One type, so the synthesis agent's output and the
+# landscape it becomes can never disagree about what fits.
+SUMMARY_MIN_CHARS = 200
+SUMMARY_MAX_CHARS = 4000
+LandscapeSummaryText = Annotated[
+    str,
+    Field(
+        min_length=SUMMARY_MIN_CHARS,
+        max_length=SUMMARY_MAX_CHARS,
+        description="Banker-readable overview of the landscape, about 300-400 words",
+    ),
+]
+
 # A landscape thinner than this is not worth handing a banker. Shared by
 # `BuyerLandscape`'s validator and the supervisor's check before synthesis, so
 # the step never spends a model call on a state that could not validate.
@@ -258,7 +277,7 @@ class LandscapeSummary(BaseModel):
     not already hold. The profile and ranked buyers come from `RunState`
     (docs/adr/0005-synthesis-writes-only-the-summary.md)."""
 
-    summary: str = Field(min_length=200, description="Banker-readable overview of the landscape")
+    summary: LandscapeSummaryText
 
 
 class BuyerLandscape(BaseModel):
@@ -268,7 +287,7 @@ class BuyerLandscape(BaseModel):
     target: TargetProfile
     strategic_buyers: list[BuyerCandidate]
     sponsor_buyers: list[BuyerCandidate]
-    summary: str = Field(min_length=200, description="Banker-readable overview of the landscape")
+    summary: LandscapeSummaryText
     generated_at: datetime = Field(default_factory=datetime.utcnow)
 
     @model_validator(mode="after")

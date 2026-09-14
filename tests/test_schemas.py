@@ -7,9 +7,11 @@ from pydantic import ValidationError
 
 from schemas import (
     MIN_LANDSCAPE_BUYERS,
+    SUMMARY_MAX_CHARS,
     BuyerCandidate,
     BuyerCandidateBatch,
     BuyerLandscape,
+    LandscapeSummary,
     BuyerType,
     Confidence,
     DeepenedBatch,
@@ -339,3 +341,30 @@ def test_router_summary_reports_the_targets_transaction_status():
         make_state(profile=acquired).summary_for_router(2)
     )
     assert "Target transaction status: unknown (no profile yet)" in make_state().summary_for_router(2)
+
+
+def landscape_with_summary(summary: str) -> dict[str, Any]:
+    return {
+        "target": PROFILE,
+        "strategic_buyers": [make_candidate(f"Strategic {i}") for i in range(MIN_LANDSCAPE_BUYERS)],
+        "sponsor_buyers": [],
+        "summary": summary,
+    }
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda text: LandscapeSummary(summary=text), id="synthesis-output"),
+        pytest.param(lambda text: BuyerLandscape.model_validate(landscape_with_summary(text)), id="landscape"),
+    ],
+)
+def test_summary_length_is_capped_the_same_way_everywhere(build: Any):
+    """The synthesis agent's summary becomes the landscape's summary, so one
+    bound governs both: an answer the agent could return must never fail when
+    the landscape is assembled from it."""
+    at_the_cap = "x" * SUMMARY_MAX_CHARS
+
+    assert build(at_the_cap)
+    with pytest.raises(ValidationError):
+        build(at_the_cap + "x")
